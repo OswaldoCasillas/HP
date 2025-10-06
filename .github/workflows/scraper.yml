@@ -1,93 +1,92 @@
 name: Palacio Scraper (RAM-only email)
 
 on:
+  schedule:
+    # 03:00 y 15:00 Ciudad de México  →  09:00 y 21:00 UTC
+    - cron: '0 9 * * *'
+    - cron: '0 21 * * *'
   workflow_dispatch:
     inputs:
       run_all:
-        description: "¿Correr TODAS las categorías?"
+        description: "Run all categories?"
         type: boolean
         default: true
       category:
-        description: "Si run_all=false, una categoría (ej. marcas)"
-        required: false
+        description: "Single category (if run_all=false)"
         type: string
+        default: ""
       start:
-        description: "start (offset) opcional"
-        required: false
+        description: "start offset"
         type: string
+        default: ""
       page_size:
-        description: "sz opcional (ej. 200)"
-        required: false
+        description: "page size (sz)"
         type: string
+        default: ""
       page_step:
-        description: "step opcional (ej. 200)"
-        required: false
+        description: "page step"
         type: string
+        default: ""
       max_pages:
-        description: "Máx. páginas (ej. 200)"
-        required: false
+        description: "max pages"
         type: string
+        default: ""
       highlight:
-        description: "Umbral descuento (default 51)"
-        required: false
+        description: "highlight % for count"
         type: string
-
-  schedule:
-    - cron: "0 */6 * * *"   # cada 6 horas (UTC)
+        default: "51"
 
 jobs:
-  run-scraper:
+  run:
     runs-on: ubuntu-latest
-    env:
-      EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
-      EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
-      EMAIL_USER: ${{ secrets.EMAIL_USER }}
-      EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-      EMAIL_TO:   ${{ secrets.EMAIL_TO }}
-      EMAIL_DEBUG: "0"
+    permissions:
+      contents: read
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas requests beautifulsoup4 xlsxwriter urllib3==2.*
 
-      - name: Compose args
-        id: args
+      # AUTO (cron): siempre --all, sin preguntar
+      - name: Run scheduled (ALL categories)
+        if: ${{ github.event_name == 'schedule' }}
+        env:
+          EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+          EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+          EMAIL_DEBUG: "0"
         run: |
-          ARGS=""
-          if [[ "${{ github.event.inputs.run_all }}" == "true" || "${{ github.event_name }}" == "schedule" ]]; then
-            ARGS="--all"
+          python palacio_category_snapshot_ramonly.py --all --highlight 51
+
+      # MANUAL (Actions → Run workflow): por defecto también --all
+      - name: Run manual (with inputs)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+          EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+          EMAIL_DEBUG: "0"
+        run: |
+          if [ "${{ inputs.run_all }}" = "true" ]; then
+            python palacio_category_snapshot_ramonly.py --all --highlight "${{ inputs.highlight }}"
           else
-            if [[ -n "${{ github.event.inputs.category }}" ]]; then
-              ARGS="-c ${{ github.event.inputs.category }}"
-            fi
-            if [[ -n "${{ github.event.inputs.start }}" ]]; then
-              ARGS="$ARGS --start ${{ github.event.inputs.start }}"
-            fi
-            if [[ -n "${{ github.event.inputs.page_size }}" ]]; then
-              ARGS="$ARGS --page-size ${{ github.event.inputs.page_size }}"
-            fi
-            if [[ -n "${{ github.event.inputs.page_step }}" ]]; then
-              ARGS="$ARGS --page-step ${{ github.event.inputs.page_step }}"
-            fi
-            if [[ -n "${{ github.event.inputs.max_pages }}" ]]; then
-              ARGS="$ARGS --max-pages ${{ github.event.inputs.max_pages }}"
-            fi
-            if [[ -n "${{ github.event.inputs.highlight }}" ]]; then
-              ARGS="$ARGS --highlight ${{ github.event.inputs.highlight }}"
-            fi
+            EXTRA=""
+            if [ -n "${{ inputs.start }}" ]; then EXTRA="$EXTRA --start ${{ inputs.start }}"; fi
+            if [ -n "${{ inputs.page_size }}" ]; then EXTRA="$EXTRA --page-size ${{ inputs.page_size }}"; fi
+            if [ -n "${{ inputs.page_step }}" ]; then EXTRA="$EXTRA --page-step ${{ inputs.page_step }}"; fi
+            if [ -n "${{ inputs.max_pages }}" ]; then EXTRA="$EXTRA --max-pages ${{ inputs.max_pages }}"; fi
+            if [ -n "${{ inputs.highlight }}" ]; then EXTRA="$EXTRA --highlight ${{ inputs.highlight }}"; fi
+            python palacio_category_snapshot_ramonly.py -c "${{ inputs.category }}" $EXTRA
           fi
-          echo "args=$ARGS" >> $GITHUB_OUTPUT
-
-      - name: Run scraper
-        run: |
-          echo "Args: ${{ steps.args.outputs.args }}"
-          python palacio_category_snapshot_ramonly.py ${{ steps.args.outputs.args }}
