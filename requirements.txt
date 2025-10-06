@@ -1,0 +1,5 @@
+requests
+pandas
+beautifulsoup4
+xlsxwriter
+urllib3>=2.0.0
