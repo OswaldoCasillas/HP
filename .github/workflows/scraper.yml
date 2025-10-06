@@ -1,0 +1,93 @@
+name: Palacio Scraper (RAM-only email)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_all:
+        description: "¿Correr TODAS las categorías?"
+        type: boolean
+        default: true
+      category:
+        description: "Si run_all=false, una categoría (ej. marcas)"
+        required: false
+        type: string
+      start:
+        description: "start (offset) opcional"
+        required: false
+        type: string
+      page_size:
+        description: "sz opcional (ej. 200)"
+        required: false
+        type: string
+      page_step:
+        description: "step opcional (ej. 200)"
+        required: false
+        type: string
+      max_pages:
+        description: "Máx. páginas (ej. 200)"
+        required: false
+        type: string
+      highlight:
+        description: "Umbral descuento (default 51)"
+        required: false
+        type: string
+
+  schedule:
+    - cron: "0 */6 * * *"   # cada 6 horas (UTC)
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    env:
+      EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+      EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+      EMAIL_USER: ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+      EMAIL_DEBUG: "0"
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compose args
+        id: args
+        run: |
+          ARGS=""
+          if [[ "${{ github.event.inputs.run_all }}" == "true" || "${{ github.event_name }}" == "schedule" ]]; then
+            ARGS="--all"
+          else
+            if [[ -n "${{ github.event.inputs.category }}" ]]; then
+              ARGS="-c ${{ github.event.inputs.category }}"
+            fi
+            if [[ -n "${{ github.event.inputs.start }}" ]]; then
+              ARGS="$ARGS --start ${{ github.event.inputs.start }}"
+            fi
+            if [[ -n "${{ github.event.inputs.page_size }}" ]]; then
+              ARGS="$ARGS --page-size ${{ github.event.inputs.page_size }}"
+            fi
+            if [[ -n "${{ github.event.inputs.page_step }}" ]]; then
+              ARGS="$ARGS --page-step ${{ github.event.inputs.page_step }}"
+            fi
+            if [[ -n "${{ github.event.inputs.max_pages }}" ]]; then
+              ARGS="$ARGS --max-pages ${{ github.event.inputs.max_pages }}"
+            fi
+            if [[ -n "${{ github.event.inputs.highlight }}" ]]; then
+              ARGS="$ARGS --highlight ${{ github.event.inputs.highlight }}"
+            fi
+          fi
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
+
+      - name: Run scraper
+        run: |
+          echo "Args: ${{ steps.args.outputs.args }}"
+          python palacio_category_snapshot_ramonly.py ${{ steps.args.outputs.args }}
