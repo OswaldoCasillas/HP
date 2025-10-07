@@ -1,21 +1,100 @@
-name: Palacio Scraper (matrix por categoría)
-
+name: Palacio Scraper (RAM-only email)
 on:
   schedule:
-    - cron: '0 9 * * *'   # 09:00 UTC
-    - cron: '0 21 * * *'  # 21:00 UTC
+    # CDMX no tiene horario de verano: 2:00 y 14:00 hora de CDMX = 08:00 y 20:00 UTC
+    - cron: '0 8,20 * * *'
   workflow_dispatch:
     inputs:
+      run_all:
+        description: 'Run ALL categories? (true/false). If true, "category" is ignored.'
+        required: true
+        default: 'true'
       category:
-        description: "Categoría única (opcional al correr manual)"
-        type: choice
+        description: 'Single category (only if run_all=false)'
         required: false
-        options:
-          - ""
+        default: ''
+      start:
+        description: 'start param (int)'
+        required: false
+        default: '0'
+      page_size:
+        description: 'sz param'
+        required: false
+        default: ''
+      page_step:
+        description: 'step param'
+        required: false
+        default: ''
+      max_pages:
+        description: 'max pages'
+        required: false
+        default: ''
+      highlight:
+        description: 'highlight %'
+        required: false
+        default: '51'
+
+env:
+  # Secrets de email (ponlos en Settings > Secrets > Actions)
+  EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+  EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+  EMAIL_USER: ${{ secrets.EMAIL_USER }}
+  EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+  EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+
+  # Lista default de categorías (SIN "marcas")
+  CATEGORIES: '["ofertas","electronica","deportes","gourmet","casapalacio","nuevos-productos","mujer","productos-liquidacion","hombre","calzado","mujer-multimarcas","hombre-multimarcas","electronica-tablets","disenadores","hogar","juguetes","categorias","salas","tendencias","más vendido"]'
+
+jobs:
+  # ──────────────────────────── UNA SOLA CATEGORÍA ────────────────────────────
+  run-one:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all == 'false' && inputs.category != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas beautifulsoup4 xlsxwriter
+
+      - name: Run ONE category
+        env:
+          START:     ${{ inputs.start }}
+          PAGE_SIZE: ${{ inputs.page_size }}
+          PAGE_STEP: ${{ inputs.page_step }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          HIGHLIGHT: ${{ inputs.highlight }}
+        run: |
+          echo ">>> Running SINGLE category: ${{ inputs.category }}"
+          python palacio_category_snapshot_ramonly.py \
+            -c "${{ inputs.category }}" \
+            --start "${START:-0}" \
+            $([ -n "${PAGE_SIZE}" ] && echo --page-size "${PAGE_SIZE}") \
+            $([ -n "${PAGE_STEP}" ] && echo --page-step "${PAGE_STEP}") \
+            $([ -n "${MAX_PAGES}" ] && echo --max-pages "${MAX_PAGES}") \
+            --highlight "${HIGHLIGHT:-51}"
+
+  # ──────────────────────────── TODAS LAS CATEGORÍAS ──────────────────────────
+  run-all:
+    # Se ejecuta en schedule o cuando run_all=true (o no pones categoría)
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.run_all == 'false' && inputs.category != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        category:
           - ofertas
           - electronica
           - deportes
-          - marcas
           - gourmet
           - casapalacio
           - nuevos-productos
@@ -32,72 +111,35 @@ on:
           - categorias
           - salas
           - tendencias
-          - "más vendido"
-      max_pages:
-        description: "Máx páginas (opcional, p.ej. 300)"
-        type: string
-        default: ""
-      page_size:
-        description: "page-size (opcional)"
-        type: string
-        default: ""
-      page_step:
-        description: "page-step (opcional)"
-        type: string
-        default: ""
-      start:
-        description: "start (opcional)"
-        type: string
-        default: ""
-      highlight:
-        description: "Umbral % alto descuento"
-        type: string
-        default: "51"
-
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-
-    # Matriz dinámica: una categoría si se eligió manualmente; si no, todas.
-strategy:
-  fail-fast: false
-  max-parallel: 4
-  matrix:
-    category: ${{ fromJSON( (github.event_name == 'workflow_dispatch' && github.event.inputs.category != '') && format('["{0}"]', github.event.inputs.category) || '["ofertas","electronica","deportes","marcas","gourmet","casapalacio","nuevos-productos","mujer","productos-liquidacion","hombre","calzado","mujer-multimarcas","hombre-multimarcas","electronica-tablets","disenadores","hogar","juguetes","categorias","salas","tendencias","más vendido"]' ) ) }}
-
-
+          - más vendido
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Instalar deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests beautifulsoup4 xlsxwriter urllib3==2.*
+          pip install requests pandas beautifulsoup4 xlsxwriter
 
-      - name: Ejecutar categoría ${{ matrix.category }}
+      - name: Run category ${{ matrix.category }}
         env:
-          EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
-          EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
-          EMAIL_DEBUG: "0"
+          START:     ${{ inputs.start }}
+          PAGE_SIZE: ${{ inputs.page_size }}
+          PAGE_STEP: ${{ inputs.page_step }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          HIGHLIGHT: ${{ inputs.highlight }}
         run: |
-          EXTRA=""
-          if [ -n "${{ github.event.inputs.start }}"     ]; then EXTRA="$EXTRA --start ${{ github.event.inputs.start }}"; fi
-          if [ -n "${{ github.event.inputs.page_size }}" ]; then EXTRA="$EXTRA --page-size ${{ github.event.inputs.page_size }}"; fi
-          if [ -n "${{ github.event.inputs.page_step }}" ]; then EXTRA="$EXTRA --page-step ${{ github.event.inputs.page_step }}"; fi
-          if [ -n "${{ github.event.inputs.max_pages }}" ]; then EXTRA="$EXTRA --max-pages ${{ github.event.inputs.max_pages }}"; fi
-          HIGHLIGHT="${{ github.event.inputs.highlight }}"
-          if [ -z "$HIGHLIGHT" ]; then HIGHLIGHT="51"; fi
-
-          echo "→ Ejecutando: ${{ matrix.category }}  $EXTRA  --highlight $HIGHLIGHT"
+          echo ">>> Running category: ${{ matrix.category }}"
           python palacio_category_snapshot_ramonly.py \
-            -c "${{ matrix.category }}" --highlight "$HIGHLIGHT" $EXTRA
+            -c "${{ matrix.category }}" \
+            --start "${START:-0}" \
+            $([ -n "${PAGE_SIZE}" ] && echo --page-size "${PAGE_SIZE}") \
+            $([ -n "${PAGE_STEP}" ] && echo --page-step "${PAGE_STEP}") \
+            $([ -n "${MAX_PAGES}" ] && echo --max-pages "${MAX_PAGES}") \
+            --highlight "${HIGHLIGHT:-51}"
+
