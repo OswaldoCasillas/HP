@@ -1,148 +1,120 @@
-name: Palacio Scraper (RAM-only email)
+name: Palacio Scraper (DISCO)
+
 on:
   schedule:
-    # CDMX no tiene horario de verano: 2:00 y 14:00 hora de CDMX = 08:00 y 20:00 UTC
-    - cron: '0 8,20 * * *'
+    # GitHub usa UTC. 08:00 y 20:00 UTC ≈ 2:00 y 14:00 en CDMX (puede variar 1h con DST).
+    - cron: "0 8,20 * * *"
   workflow_dispatch:
     inputs:
       run_all:
-        description: 'Run ALL categories? (true/false). If true, "category" is ignored.'
+        description: "Ejecutar TODAS las categorías"
+        type: boolean
+        default: true
         required: true
-        default: 'true'
       category:
-        description: 'Single category (only if run_all=false)'
+        description: "Categoría única (si run_all = false). Ej: juguetes"
+        type: string
         required: false
-        default: ''
+        default: ""
       start:
-        description: 'start param (int)'
+        description: "Offset inicial start="
+        type: string
         required: false
-        default: '0'
+        default: ""
       page_size:
-        description: 'sz param'
+        description: "Tamaño de página sz="
+        type: string
         required: false
-        default: ''
+        default: ""
       page_step:
-        description: 'step param'
+        description: "Salto de start"
+        type: string
         required: false
-        default: ''
+        default: ""
       max_pages:
-        description: 'max pages'
+        description: "Máximo de páginas"
+        type: string
         required: false
-        default: ''
+        default: ""
       highlight:
-        description: 'highlight %'
+        description: "Umbral % para resaltar (XLSX)"
+        type: string
         required: false
-        default: '51'
+        default: "51"
 
-env:
-  # Secrets de email (ponlos en Settings > Secrets > Actions)
-  EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
-  EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
-  EMAIL_USER: ${{ secrets.EMAIL_USER }}
-  EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-  EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+permissions:
+  contents: read
 
-  # Lista default de categorías (SIN "marcas")
-  CATEGORIES: '["ofertas","electronica","deportes","gourmet","casapalacio","nuevos-productos","mujer","productos-liquidacion","hombre","calzado","mujer-multimarcas","hombre-multimarcas","electronica-tablets","disenadores","hogar","juguetes","categorias","salas","tendencias","más vendido"]'
+concurrency:
+  group: palacio-scraper
+  cancel-in-progress: false
 
 jobs:
-  # ──────────────────────────── UNA SOLA CATEGORÍA ────────────────────────────
-  run-one:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all == 'false' && inputs.category != '' }}
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 90
+
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter
+          python -m pip install -U pip
+          # Si tienes requirements.txt, úsalo; si no, instala directas:
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+          fi
 
-      - name: Run ONE category
-        env:
-          START:     ${{ inputs.start }}
-          PAGE_SIZE: ${{ inputs.page_size }}
-          PAGE_STEP: ${{ inputs.page_step }}
-          MAX_PAGES: ${{ inputs.max_pages }}
-          HIGHLIGHT: ${{ inputs.highlight }}
+      - name: Show runner time (UTC)
+        run: date -u
+
+      - name: Run scraper
+        shell: bash
         run: |
-          echo ">>> Running SINGLE category: ${{ inputs.category }}"
-          python palacio_category_snapshot_ramonly.py \
-            -c "${{ inputs.category }}" \
-            --start "${START:-0}" \
-            $([ -n "${PAGE_SIZE}" ] && echo --page-size "${PAGE_SIZE}") \
-            $([ -n "${PAGE_STEP}" ] && echo --page-step "${PAGE_STEP}") \
-            $([ -n "${MAX_PAGES}" ] && echo --max-pages "${MAX_PAGES}") \
-            --highlight "${HIGHLIGHT:-51}"
+          set -euo pipefail
+          # Construir argumentos según si es schedule o manual
+          ARGS=""
+          # Inputs solo existen en workflow_dispatch; para schedule vienen vacíos
+          RUN_ALL="${{ github.event_name == 'workflow_dispatch' && inputs.run_all || 'true' }}"
+          CATEGORY="${{ github.event.inputs.category || '' }}"
+          START="${{ github.event.inputs.start || '' }}"
+          PAGE_SIZE="${{ github.event.inputs.page_size || '' }}"
+          PAGE_STEP="${{ github.event.inputs.page_step || '' }}"
+          MAX_PAGES="${{ github.event.inputs.max_pages || '' }}"
+          HIGHLIGHT="${{ github.event.inputs.highlight || '' }}"
 
-  # ──────────────────────────── TODAS LAS CATEGORÍAS ──────────────────────────
-  run-all:
-    # Se ejecuta en schedule o cuando run_all=true (o no pones categoría)
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.run_all == 'false' && inputs.category != '') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 330
-    strategy:
-      fail-fast: false
-      matrix:
-        category:
-          - ofertas
-          - electronica
-          - deportes
-          - gourmet
-          - casapalacio
-          - nuevos-productos
-          - mujer
-          - productos-liquidacion
-          - hombre
-          - calzado
-          - mujer-multimarcas
-          - hombre-multimarcas
-          - electronica-tablets
-          - disenadores
-          - hogar
-          - juguetes
-          - categorias
-          - salas
-          - tendencias
-          - más vendido
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+          if [[ "${RUN_ALL}" == "true" ]]; then
+            ARGS+=" --all"
+          else
+            if [[ -z "${CATEGORY}" ]]; then
+              echo "❌ Debes indicar 'category' cuando run_all=false."
+              exit 1
+            fi
+            ARGS+=" -c ${CATEGORY}"
+          fi
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+          [[ -n "${START}" ]] && ARGS+=" --start ${START}"
+          [[ -n "${PAGE_SIZE}" ]] && ARGS+=" --page-size ${PAGE_SIZE}"
+          [[ -n "${PAGE_STEP}" ]] && ARGS+=" --page-step ${PAGE_STEP}"
+          [[ -n "${MAX_PAGES}" ]] && ARGS+=" --max-pages ${MAX_PAGES}"
+          [[ -n "${HIGHLIGHT}" ]] && ARGS+=" --highlight ${HIGHLIGHT}"
+
+          echo "▶ python palacio_category_snapshot.py ${ARGS}"
+          python palacio_category_snapshot.py ${ARGS}
+
+      - name: Upload outputs (out_palacio/)
+        if: always()  # sube aunque falle, para poder revisar lo que alcanzó a generar
+        uses: actions/upload-artifact@v4
         with:
-          python-version: '3.11'
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter
-
-      - name: Run category ${{ matrix.category }}
-        env:
-          START:     ${{ inputs.start }}
-          PAGE_SIZE: ${{ inputs.page_size }}
-          PAGE_STEP: ${{ inputs.page_step }}
-          MAX_PAGES: ${{ inputs.max_pages }}
-          HIGHLIGHT: ${{ inputs.highlight }}
-        run: |
-          echo ">>> Running category: ${{ matrix.category }}"
-          python palacio_category_snapshot_ramonly.py \
-            -c "${{ matrix.category }}" \
-            --start "${START:-0}" \
-            $([ -n "${PAGE_SIZE}" ] && echo --page-size "${PAGE_SIZE}") \
-            $([ -n "${PAGE_STEP}" ] && echo --page-step "${PAGE_STEP}") \
-            $([ -n "${MAX_PAGES}" ] && echo --max-pages "${MAX_PAGES}") \
-            --highlight "${HIGHLIGHT:-51}"
-      - name: Build & email master consolidated
-        run: |
-          python aggregate_master.py
-
+          name: out_palacio-${{ github.run_id }}
+          path: out_palacio/**
+          if-no-files-found: warn
+          retention-days: 10
