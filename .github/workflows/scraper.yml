@@ -1,8 +1,8 @@
-name: Palacio Scraper (DISCO)
+name: Palacio Scraper (DISCO + ALL_CHANGES CSV)
 
 on:
   schedule:
-    # GitHub usa UTC. 08:00 y 20:00 UTC ≈ 02:00 y 14:00 CDMX (según DST).
+    # 08:00 y 20:00 UTC ≈ 02:00 y 14:00 CDMX (según DST)
     - cron: "0 8,20 * * *"
   workflow_dispatch:
     inputs:
@@ -69,7 +69,8 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+            # openpyxl para leer las hojas CHANGES de los .xlsx
+            pip install requests pandas beautifulsoup4 xlsxwriter openpyxl pyarrow
           fi
 
       - name: Show runner time (UTC)
@@ -80,7 +81,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Detecta si fue manual o por cron y toma inputs si existen
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             RUN_ALL="${{ github.event.inputs.run_all }}"
             CATEGORY="${{ github.event.inputs.category }}"
@@ -119,6 +119,37 @@ jobs:
           echo "▶ python palacio_category_snapshot.py ${ARGS}"
           python palacio_category_snapshot.py ${ARGS}
 
+      - name: Build ALL_CHANGES CSV (desde los XLSX)
+        if: always()
+        run: |
+          python - << 'PY'
+          import pandas as pd, glob, os, pathlib
+          base = pathlib.Path("out_palacio")
+          files = glob.glob(str(base / "**/*_snapshot_*.xlsx"), recursive=True)
+          rows = []
+          for f in files:
+            try:
+              df = pd.read_excel(f, sheet_name="CHANGES", engine="openpyxl")
+            except Exception:
+              continue
+            # si solo trae columna "info" (mensaje "Sin cambios..."), saltamos
+            if df.empty or (set(df.columns) == {"info"}):
+              continue
+            cat = pathlib.Path(f).parts[-3]  # out_palacio/<prefix>/<YYYY-MM>/file.xlsx
+            df.insert(0, "category", cat)
+            df.insert(1, "snapshot_file", os.path.basename(f))
+            rows.append(df)
+          if rows:
+            out = pd.concat(rows, ignore_index=True)
+            out_dir = base
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"ALL_CHANGES_{os.environ.get('GITHUB_RUN_ID','local')}.csv"
+            out.to_csv(out_path, index=False, encoding="utf-8-sig")
+            print(f"✓ Consolidado guardado en {out_path}")
+          else:
+            print("⚠️ No se encontraron filas reales en CHANGES para consolidar.")
+          PY
+
       - name: Upload outputs (out_palacio/)
         if: always()
         uses: actions/upload-artifact@v4
@@ -139,11 +170,10 @@ jobs:
             ls -lh "out_palacio_${{ github.run_id }}.zip"
           else
             echo "⚠️ No existe out_palacio/, no se genera ZIP."
-            # Crear placeholder vacío para que el paso de email no truene
             echo "no outputs" > "out_palacio_${{ github.run_id }}.txt"
           fi
 
-      - name: Email ZIP via Gmail
+      - name: Email ZIP + ALL_CHANGES via Gmail
         if: always()
         env:
           EMAIL_HOST: smtp.gmail.com
@@ -158,8 +188,17 @@ jobs:
 
           run_id = os.environ.get("GITHUB_RUN_ID")
           zip_path = f"out_palacio_{run_id}.zip"
-          fallback_txt = f"out_palacio_{run_id}.txt"
-          attach_path = zip_path if pathlib.Path(zip_path).exists() else fallback_txt
+          placeholder = f"out_palacio_{run_id}.txt"
+          all_changes = f"out_palacio/ALL_CHANGES_{run_id}.csv"
+
+          attachments = []
+          if pathlib.Path(zip_path).exists():
+              attachments.append(zip_path)
+          elif pathlib.Path(placeholder).exists():
+              attachments.append(placeholder)
+
+          if pathlib.Path(all_changes).exists():
+              attachments.append(all_changes)
 
           user = os.environ.get("EMAIL_USER","")
           pwd  = os.environ.get("EMAIL_PASS","")
@@ -172,22 +211,20 @@ jobs:
           msg = EmailMessage()
           msg["From"] = user
           msg["To"] = to
-          msg["Subject"] = "[Scraper] out_palacio listo"
-          msg.set_content("Adjunto ZIP (o placeholder) con la carpeta out_palacio generada en esta corrida.")
+          msg["Subject"] = "[Scraper] out_palacio + ALL_CHANGES"
+          msg.set_content("Adjunto:\n- ZIP con out_palacio\n- ALL_CHANGES CSV consolidado (si hubo cambios)")
 
-          ctype, _ = mimetypes.guess_type(attach_path)
-          if not ctype: ctype = "application/octet-stream"
-          maintype, subtype = ctype.split("/", 1)
-          with open(attach_path, "rb") as f:
-              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(attach_path))
+          for p in attachments:
+            ctype, _ = mimetypes.guess_type(p)
+            if not ctype: ctype = "application/octet-stream"
+            maintype, subtype = ctype.split("/", 1)
+            with open(p, "rb") as f:
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(p))
 
           cx = smtplib.SMTP(os.environ["EMAIL_HOST"], int(os.environ["EMAIL_PORT"]))
           cx.ehlo(); cx.starttls(context=ssl.create_default_context()); cx.ehlo()
           cx.login(user, pwd)
           cx.send_message(msg)
           cx.quit()
-          print("📧 Enviado:", attach_path)
+          print("📧 Enviado adjuntos:", ", ".join(attachments) if attachments else "(ninguno)")
           PY
-
-
-          
