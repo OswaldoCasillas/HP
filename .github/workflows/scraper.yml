@@ -1,8 +1,8 @@
-name: Palacio Scraper (DISCO + ALL_CHANGES CSV)
+name: Palacio Scraper (Consolidado a Excel)
 
 on:
   schedule:
-    # 08:00 y 20:00 UTC ≈ 02:00 y 14:00 CDMX (según DST)
+    # 08:00 y 20:00 UTC ≈ 02:00 y 14:00 CDMX (puede variar con DST)
     - cron: "0 8,20 * * *"
   workflow_dispatch:
     inputs:
@@ -37,7 +37,7 @@ on:
         required: false
         default: ""
       highlight:
-        description: "Umbral % para resaltar (XLSX)"
+        description: "Umbral % para resaltar"
         type: string
         required: false
         default: "51"
@@ -69,7 +69,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # openpyxl para leer las hojas CHANGES de los .xlsx
+            # openpyxl para leer las hojas del XLSX; xlsxwriter para escribir el consolidado
             pip install requests pandas beautifulsoup4 xlsxwriter openpyxl pyarrow
           fi
 
@@ -80,7 +80,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
+          # Inputs cuando es manual; en schedule no existen y ponemos defaults
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             RUN_ALL="${{ github.event.inputs.run_all }}"
             CATEGORY="${{ github.event.inputs.category }}"
@@ -119,61 +119,80 @@ jobs:
           echo "▶ python palacio_category_snapshot.py ${ARGS}"
           python palacio_category_snapshot.py ${ARGS}
 
-      - name: Build ALL_CHANGES CSV (desde los XLSX)
+      - name: Build consolidated Excel (CHANGES / NEW / REMOVED)
         if: always()
         run: |
           python - << 'PY'
           import pandas as pd, glob, os, pathlib
+          from datetime import datetime
+
           base = pathlib.Path("out_palacio")
           files = glob.glob(str(base / "**/*_snapshot_*.xlsx"), recursive=True)
-          rows = []
-          for f in files:
+
+          def read_sheet(path, sheet):
             try:
-              df = pd.read_excel(f, sheet_name="CHANGES", engine="openpyxl")
+              df = pd.read_excel(path, sheet_name=sheet, engine="openpyxl")
             except Exception:
-              continue
-            # si solo trae columna "info" (mensaje "Sin cambios..."), saltamos
-            if df.empty or (set(df.columns) == {"info"}):
-              continue
-            cat = pathlib.Path(f).parts[-3]  # out_palacio/<prefix>/<YYYY-MM>/file.xlsx
-            df.insert(0, "category", cat)
-            df.insert(1, "snapshot_file", os.path.basename(f))
-            rows.append(df)
-          if rows:
-            out = pd.concat(rows, ignore_index=True)
-            out_dir = base
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"ALL_CHANGES_{os.environ.get('GITHUB_RUN_ID','local')}.csv"
-            out.to_csv(out_path, index=False, encoding="utf-8-sig")
-            print(f"✓ Consolidado guardado en {out_path}")
-          else:
-            print("⚠️ No se encontraron filas reales en CHANGES para consolidar.")
+              return None
+            # si solo trae "info", no aporta al consolidado
+            if df is None or df.empty or (set(df.columns) == {"info"}):
+              return None
+            df.insert(0, "category", pathlib.Path(path).parts[-3])  # out_palacio/<prefix>/<YYYY-MM>/file.xlsx
+            df.insert(1, "snapshot_file", os.path.basename(path))
+            return df
+
+          dfs_changes, dfs_new, dfs_removed = [], [], []
+          for f in files:
+            c = read_sheet(f, "CHANGES")
+            n = read_sheet(f, "NEW")
+            r = read_sheet(f, "REMOVED")
+            if c is not None: dfs_changes.append(c)
+            if n is not None: dfs_new.append(n)
+            if r is not None: dfs_removed.append(r)
+
+          out_changes = pd.concat(dfs_changes, ignore_index=True) if dfs_changes else pd.DataFrame({"info": ["Sin cambios detectados"]})
+          out_new     = pd.concat(dfs_new,     ignore_index=True) if dfs_new     else pd.DataFrame({"info": ["Sin nuevos productos"]})
+          out_removed = pd.concat(dfs_removed, ignore_index=True) if dfs_removed else pd.DataFrame({"info": ["Sin productos removidos"]})
+
+          base.mkdir(parents=True, exist_ok=True)
+          ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+          path = base / f"ALL_DIFFS_{os.environ.get('GITHUB_RUN_ID','local')}.xlsx"
+
+          with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+            out_changes.to_excel(writer, index=False, sheet_name="CHANGES")
+            out_new.to_excel(writer, index=False, sheet_name="NEW")
+            out_removed.to_excel(writer, index=False, sheet_name="REMOVED")
+
+            wb = writer.book
+            money  = wb.add_format({"num_format": "#,##0.00"})
+            pctfmt = wb.add_format({'num_format': '0.00"%"'})
+
+            def fmt(ws, df):
+              cols = list(df.columns)
+              ws.set_column(0, len(cols)-1, 18)
+              for nm in [c for c in cols if "price" in c]:
+                i = cols.index(nm); ws.set_column(i, i, 14, money)
+              for nm in [c for c in cols if "discount_pct" in c]:
+                i = cols.index(nm); ws.set_column(i, i, 12, pctfmt)
+              ws.freeze_panes(1, 0); ws.autofilter(0, 0, max(len(df),1), len(cols)-1)
+
+            fmt(writer.sheets["CHANGES"], out_changes)
+            fmt(writer.sheets["NEW"], out_new)
+            fmt(writer.sheets["REMOVED"], out_removed)
+
+          print(f"✓ Consolidado Excel: {path}")
           PY
 
-      - name: Upload outputs (out_palacio/)
+      - name: Upload consolidated Excel
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: out_palacio-${{ github.run_id }}
-          path: out_palacio/**
+          name: ALL_DIFFS-${{ github.run_id }}
+          path: out_palacio/ALL_DIFFS_${{ github.run_id }}.xlsx
           if-no-files-found: warn
           retention-days: 10
 
-      - name: Zip out_palacio
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${{ github.workspace }}"
-          if [ -d "out_palacio" ]; then
-            zip -r "out_palacio_${{ github.run_id }}.zip" out_palacio
-            ls -lh "out_palacio_${{ github.run_id }}.zip"
-          else
-            echo "⚠️ No existe out_palacio/, no se genera ZIP."
-            echo "no outputs" > "out_palacio_${{ github.run_id }}.txt"
-          fi
-
-      - name: Email ZIP + ALL_CHANGES via Gmail
+      - name: Email consolidated Excel via Gmail
         if: always()
         env:
           EMAIL_HOST: smtp.gmail.com
@@ -187,18 +206,7 @@ jobs:
           from email.message import EmailMessage
 
           run_id = os.environ.get("GITHUB_RUN_ID")
-          zip_path = f"out_palacio_{run_id}.zip"
-          placeholder = f"out_palacio_{run_id}.txt"
-          all_changes = f"out_palacio/ALL_CHANGES_{run_id}.csv"
-
-          attachments = []
-          if pathlib.Path(zip_path).exists():
-              attachments.append(zip_path)
-          elif pathlib.Path(placeholder).exists():
-              attachments.append(placeholder)
-
-          if pathlib.Path(all_changes).exists():
-              attachments.append(all_changes)
+          xlsx_path = f"out_palacio/ALL_DIFFS_{run_id}.xlsx"
 
           user = os.environ.get("EMAIL_USER","")
           pwd  = os.environ.get("EMAIL_PASS","")
@@ -211,20 +219,23 @@ jobs:
           msg = EmailMessage()
           msg["From"] = user
           msg["To"] = to
-          msg["Subject"] = "[Scraper] out_palacio + ALL_CHANGES"
-          msg.set_content("Adjunto:\n- ZIP con out_palacio\n- ALL_CHANGES CSV consolidado (si hubo cambios)")
+          msg["Subject"] = "[Scraper] ALL_DIFFS consolidado"
+          msg.set_content("Adjunto Excel con las hojas CHANGES / NEW / REMOVED consolidadas de esta corrida.")
 
-          for p in attachments:
-            ctype, _ = mimetypes.guess_type(p)
-            if not ctype: ctype = "application/octet-stream"
+          if pathlib.Path(xlsx_path).exists():
+            ctype, _ = mimetypes.guess_type(xlsx_path)
+            if not ctype: ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             maintype, subtype = ctype.split("/", 1)
-            with open(p, "rb") as f:
-              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(p))
+            with open(xlsx_path, "rb") as f:
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(xlsx_path))
+            print("Adjuntado:", xlsx_path)
+          else:
+            msg.set_content("No hubo archivos consolidados. Revisa logs de la corrida.")
 
           cx = smtplib.SMTP(os.environ["EMAIL_HOST"], int(os.environ["EMAIL_PORT"]))
           cx.ehlo(); cx.starttls(context=ssl.create_default_context()); cx.ehlo()
           cx.login(user, pwd)
           cx.send_message(msg)
           cx.quit()
-          print("📧 Enviado adjuntos:", ", ".join(attachments) if attachments else "(ninguno)")
+          print("📧 Enviado consolidado")
           PY
