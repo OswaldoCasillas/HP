@@ -60,19 +60,12 @@ jobs:
     timeout-minutes: 90
 
     # Matriz dinámica: una categoría si se eligió manualmente; si no, todas.
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        category: ${{ fromJSON(
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.category != '')
-          && format('["{0}"]', github.event.inputs.category)
-          || '[
-              "ofertas","electronica","deportes","marcas","gourmet","casapalacio","nuevos-productos",
-              "mujer","productos-liquidacion","hombre","calzado","mujer-multimarcas","hombre-multimarcas",
-              "electronica-tablets","disenadores","hogar","juguetes","categorias","salas","tendencias","más vendido"
-            ]'
-        ) }}
+strategy:
+  fail-fast: false
+  max-parallel: 4
+  matrix:
+    category: ${{ fromJSON( (github.event_name == 'workflow_dispatch' && github.event.inputs.category != '') && format('["{0}"]', github.event.inputs.category) || '["ofertas","electronica","deportes","marcas","gourmet","casapalacio","nuevos-productos","mujer","productos-liquidacion","hombre","calzado","mujer-multimarcas","hombre-multimarcas","electronica-tablets","disenadores","hogar","juguetes","categorias","salas","tendencias","más vendido"]' ) ) }}
+
 
     steps:
       - name: Checkout
