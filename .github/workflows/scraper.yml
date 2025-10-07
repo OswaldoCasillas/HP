@@ -1,63 +1,113 @@
-name: Palacio Scraper (RAM-only email)
+name: Palacio Scraper (matrix por categoría)
 
 on:
   schedule:
-    # 03:00 y 15:00 Ciudad de México  →  09:00 y 21:00 UTC
+    # 03:00 y 15:00 CDMX  →  09:00 y 21:00 UTC
     - cron: '0 9 * * *'
     - cron: '0 21 * * *'
   workflow_dispatch:
     inputs:
-      run_all:
-        description: "Run all categories?"
-        type: boolean
-        default: true
       category:
-        description: "Single category (if run_all=false)"
-        type: string
-        default: ""
+        description: "Categoría única (opcional al correr manual)."
+        type: choice
+        required: false
+        options:
+          - ""
+          - ofertas
+          - electronica
+          - deportes
+          - marcas
+          - gourmet
+          - casapalacio
+          - nuevos-productos
+          - mujer
+          - productos-liquidacion
+          - hombre
+          - calzado
+          - mujer-multimarcas
+          - hombre-multimarcas
+          - electronica-tablets
+          - disenadores
+          - hogar
+          - juguetes
+          - categorias
+          - salas
+          - tendencias
+          - más vendido
       start:
-        description: "start offset"
+        description: "start (opcional)"
         type: string
         default: ""
       page_size:
-        description: "page size (sz)"
+        description: "page-size (opcional)"
         type: string
         default: ""
       page_step:
-        description: "page step"
+        description: "page-step (opcional)"
         type: string
         default: ""
       max_pages:
-        description: "max pages"
+        description: "max-pages (opcional, p.ej. 300)"
         type: string
         default: ""
       highlight:
-        description: "highlight % for count"
+        description: "Umbral % alto descuento"
         type: string
         default: "51"
 
 jobs:
-  run:
+  scrape:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 90        # cada categoría tiene 90 min máx
+    strategy:
+      fail-fast: false
+      max-parallel: 4          # controla cuántas categorías a la vez
+      matrix:
+        category:
+          # LISTA por defecto para corridas programadas
+          - ofertas
+          - electronica
+          - deportes
+          - marcas
+          - gourmet
+          - casapalacio
+          - nuevos-productos
+          - mujer
+          - productos-liquidacion
+          - hombre
+          - calzado
+          - mujer-multimarcas
+          - hombre-multimarcas
+          - electronica-tablets
+          - disenadores
+          - hogar
+          - juguetes
+          - categorias
+          - salas
+          - tendencias
+          - más vendido
+
+    # Si es manual y el usuario eligió una categoría, limitamos la matrix a 1
+    # (truco simple: saltamos el job si la elegida no coincide)
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.category == '' || inputs.category == matrix.category
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Instalar deps
         run: |
           python -m pip install --upgrade pip
           pip install pandas requests beautifulsoup4 xlsxwriter urllib3==2.*
 
-      # AUTO (cron): siempre --all, sin preguntar
-      - name: Run scheduled (ALL categories)
-        if: ${{ github.event_name == 'schedule' }}
+      - name: Ejecutar categoría
         env:
           EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
           EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
@@ -66,27 +116,16 @@ jobs:
           EMAIL_TO:   ${{ secrets.EMAIL_TO }}
           EMAIL_DEBUG: "0"
         run: |
-          python palacio_category_snapshot_ramonly.py --all --highlight 51
+          EXTRA=""
+          # inputs sólo existen en workflow_dispatch; en schedule quedan vacíos
+          if [ -n "${{ inputs.start }}" ]; then EXTRA="$EXTRA --start ${{ inputs.start }}"; fi
+          if [ -n "${{ inputs.page_size }}" ]; then EXTRA="$EXTRA --page-size ${{ inputs.page_size }}"; fi
+          if [ -n "${{ inputs.page_step }}" ]; then EXTRA="$EXTRA --page-step ${{ inputs.page_step }}"; fi
+          if [ -n "${{ inputs.max_pages }}" ]; then EXTRA="$EXTRA --max-pages ${{ inputs.max_pages }}"; fi
 
-      # MANUAL (Actions → Run workflow): por defecto también --all
-      - name: Run manual (with inputs)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        env:
-          EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
-          EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
-          EMAIL_DEBUG: "0"
-        run: |
-          if [ "${{ inputs.run_all }}" = "true" ]; then
-            python palacio_category_snapshot_ramonly.py --all --highlight "${{ inputs.highlight }}"
-          else
-            EXTRA=""
-            if [ -n "${{ inputs.start }}" ]; then EXTRA="$EXTRA --start ${{ inputs.start }}"; fi
-            if [ -n "${{ inputs.page_size }}" ]; then EXTRA="$EXTRA --page-size ${{ inputs.page_size }}"; fi
-            if [ -n "${{ inputs.page_step }}" ]; then EXTRA="$EXTRA --page-step ${{ inputs.page_step }}"; fi
-            if [ -n "${{ inputs.max_pages }}" ]; then EXTRA="$EXTRA --max-pages ${{ inputs.max_pages }}"; fi
-            if [ -n "${{ inputs.highlight }}" ]; then EXTRA="$EXTRA --highlight ${{ inputs.highlight }}"; fi
-            python palacio_category_snapshot_ramonly.py -c "${{ inputs.category }}" $EXTRA
-          fi
+          HIGHLIGHT="${{ inputs.highlight }}"
+          if [ -z "$HIGHLIGHT" ]; then HIGHLIGHT="51"; fi
+
+          echo "→ Ejecutando categoría: ${{ matrix.category }}"
+          python palacio_category_snapshot_ramonly.py \
+            -c "${{ matrix.category }}" --highlight "$HIGHLIGHT" $EXTRA
