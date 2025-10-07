@@ -142,4 +142,7 @@ jobs:
             $([ -n "${PAGE_STEP}" ] && echo --page-step "${PAGE_STEP}") \
             $([ -n "${MAX_PAGES}" ] && echo --max-pages "${MAX_PAGES}") \
             --highlight "${HIGHLIGHT:-51}"
+      - name: Build & email master consolidated
+        run: |
+          python aggregate_master.py
 
