@@ -147,7 +147,7 @@ def build_master(hours_back: int = 8) -> Path | None:
     return out_xlsx
 
 def main():
-    out = build_master(hours_back=8)
+    out = build_master(hours_back=15)
     if out:
         with open(out, "rb") as f:
             data = f.read()
