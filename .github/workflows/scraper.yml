@@ -54,9 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      # Si quieres forzar una carpeta destino concreta por ID, define este secret:
-      #   Settings → Secrets and variables → Actions → New repository secret
-      #   Name: GDRIVE_FOLDER_ID   Value: <ID de la carpeta en Drive>
+      # Opcional: ID de carpeta destino en Drive; si no lo defines, sube a la raíz del remote gdrive.
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
 
     steps:
@@ -183,7 +181,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 10
 
-      # ───────────────────────────── rclone: instalar ─────────────────────────────
+      # ───────────────────────── rclone: instalar y configurar ─────────────────────────
       - name: Install rclone
         if: always()
         run: |
@@ -193,7 +191,6 @@ jobs:
           sudo mv rclone-*-linux-amd64/rclone /usr/local/bin/rclone
           rclone version
 
-      # Escribir rclone.conf desde el secret RCLONE_CONFIG (acepta plano o base64)
       - name: Write rclone.conf from secret
         if: always()
         env:
@@ -201,36 +198,31 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.config/rclone
-          # intenta base64 → si falla, lo guarda tal cual
+          # Si el secret está en base64 lo decodifica; si no, lo escribe tal cual
           (echo "$RCLONE_CONFIG" | base64 -d > ~/.config/rclone/rclone.conf) || \
           (echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf)
           echo "==== rclone remotes ===="
           rclone listremotes || true
+          # Diagnóstico de OAuth (opcional)
+          rclone about gdrive: || true
 
-      # Subir todo out_palacio a Drive
-      # Opción 1: por ID de carpeta (no requiere remote llamado)
-      - name: Upload out_palacio to Drive (by folder ID)
-        if: always() && env.GDRIVE_FOLDER_ID != ''
+      # Subir todo out_palacio a Drive usando el remote gdrive
+      - name: Upload out_palacio to Drive with rclone (remote = gdrive)
+        if: always()
         run: |
           set -euo pipefail
           if [ -d "out_palacio" ]; then
-            rclone copy "out_palacio" ":drive,root_folder_id=${GDRIVE_FOLDER_ID}:" --create-empty-src-dirs -P
-            echo "✓ Upload con rclone (folder_id=${GDRIVE_FOLDER_ID}) terminado"
+            if [ -n "${GDRIVE_FOLDER_ID:-}" ]; then
+              # Enviar a carpeta específica por ID
+              rclone copy "out_palacio" "gdrive:" --drive-root-folder-id="${GDRIVE_FOLDER_ID}" --create-empty-src-dirs -P
+            else
+              # Enviar a la raíz del usuario del token
+              rclone copy "out_palacio" "gdrive:" --create-empty-src-dirs -P
+            fi
+            echo "✓ Upload con rclone (remote=gdrive) terminado"
           else
             echo "⚠️ No existe out_palacio; nada que subir."
           fi
-
-      # Opción 2: si prefieres un remote, por ejemplo "mydrive:", descomenta y ajusta el path
-      # - name: Upload out_palacio to Drive (using remote)
-      #   if: always() && env.GDRIVE_FOLDER_ID == ''
-      #   run: |
-      #     set -euo pipefail
-      #     if [ -d "out_palacio" ]; then
-      #       rclone copy "out_palacio" "mydrive:Scrapper PH/ph" --create-empty-src-dirs -P
-      #       echo "✓ Upload con rclone (remote=mydrive) terminado"
-      #     else
-      #       echo "⚠️ No existe out_palacio; nada que subir."
-      #     fi
 
       - name: Email ONLY CHANGES Excel via Gmail
         if: always()
