@@ -52,7 +52,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
       # Opcional: ID de carpeta destino en Drive; si no lo defines, sube a la raíz del remote gdrive.
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
