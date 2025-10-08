@@ -54,7 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      GDRIVE_FOLDER_ID: 1l5M_KGzOiQt20x8Ht7Jmp1nGTeoKRXyX   # <-- TU carpeta en Drive
+      # 🔴 Cambia esto por el ID de TU carpeta en Drive
+      GDRIVE_FOLDER_ID: 1l5M_KGzOiQt20x8Ht7Jmp1nGTeoKRXyX
 
     steps:
       - name: Checkout
@@ -83,8 +84,8 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             RUN_ALL="${{ github.event.inputs.run_all }}"
-            CATEGORY="${{ github.event.inputs.category }}"
-            START="${{ github.event.inputs.start }}"
+            CATEGORY='${{ github.event.inputs.category }}'
+            START='${{ github.event.inputs.start }}'
             PAGE_SIZE='${{ github.event.inputs.page_size }}'
             PAGE_STEP='${{ github.event.inputs.page_step }}'
             MAX_PAGES='${{ github.event.inputs.max_pages }}'
@@ -124,8 +125,6 @@ jobs:
         run: |
           python - << 'PY'
           import pandas as pd, glob, os, pathlib
-          from datetime import datetime
-
           base = pathlib.Path("out_palacio")
           files = glob.glob(str(base / "**/*_snapshot_*.xlsx"), recursive=True)
 
@@ -136,9 +135,7 @@ jobs:
               return None
             if df is None or df.empty or (set(df.columns) == {"info"}):
               return None
-            # out_palacio/<prefix>/<YYYY-MM>/file.xlsx
             parts = pathlib.Path(path).parts
-            # parts[-3] = prefix, parts[-2] = YYYY-MM
             cat = parts[-3] if len(parts) >= 3 else ""
             df.insert(0, "category", cat)
             df.insert(1, "snapshot_file", os.path.basename(path))
@@ -162,13 +159,11 @@ jobs:
           path_all = base / f"ALL_DIFFS_{run_id}.xlsx"
           path_changes = base / f"ALL_DIFFS_CHANGES_{run_id}.xlsx"
 
-          # Escribe el "ALL" (las tres hojas)
           with pd.ExcelWriter(path_all, engine="xlsxwriter") as writer:
             out_changes.to_excel(writer, index=False, sheet_name="CHANGES")
             out_new.to_excel(writer, index=False, sheet_name="NEW")
             out_removed.to_excel(writer, index=False, sheet_name="REMOVED")
 
-          # Escribe el "solo CHANGES"
           with pd.ExcelWriter(path_changes, engine="xlsxwriter") as writer:
             out_changes.to_excel(writer, index=False, sheet_name="CHANGES")
 
@@ -197,7 +192,7 @@ jobs:
           SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
         run: |
           python - << 'PY'
-          import os, io, json, pathlib, mimetypes
+          import os, json, pathlib, mimetypes
           from datetime import datetime
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
@@ -228,11 +223,9 @@ jobs:
             mtype, _ = mimetypes.guess_type(str(path))
             media = MediaFileUpload(str(path), mimetype=mtype or "application/octet-stream", resumable=True)
             meta = {"name": path.name, "parents": [sub_id]}
-            # Si ya existe con mismo nombre en subcarpeta, crea otro (versiónado simple).
             drive.files().create(body=meta, media_body=media, fields="id").execute()
             print("↑ Subido a Drive:", path)
 
-          # Sube todo out_palacio/*
           base = pathlib.Path("out_palacio")
           if base.exists():
             for p in base.rglob("*"):
