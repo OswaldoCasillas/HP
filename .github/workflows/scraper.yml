@@ -1,8 +1,8 @@
-name: Palacio Scraper (DISCO → Drive + Email CHANGES)
+name: Palacio Scraper (DISCO → Drive + Email CHANGES + rclone)
 
 on:
   schedule:
-    # 08:00 y 20:00 UTC ≈ 02:00 y 14:00 CDMX (ajusta si cambia DST)
+    # 08:00 y 20:00 UTC ≈ 02:00 y 14:00 CDMX
     - cron: "0 8,20 * * *"
   workflow_dispatch:
     inputs:
@@ -54,9 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      # 🔴 Cambia esto por el ID de TU carpeta en Drive
-      GDRIVE_FOLDER_ID: 1WjDwG1RRg8dqh9gqMe6ztRU4zZ9jXgMK
-
+      # Si quieres forzar una carpeta destino concreta por ID, define este secret:
+      #   Settings → Secrets and variables → Actions → New repository secret
+      #   Name: GDRIVE_FOLDER_ID   Value: <ID de la carpeta en Drive>
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
 
     steps:
       - name: Checkout
@@ -85,8 +86,8 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             RUN_ALL="${{ github.event.inputs.run_all }}"
-            CATEGORY='${{ github.event.inputs.category }}'
-            START='${{ github.event.inputs.start }}'
+            CATEGORY="${{ github.event.inputs.category }}"
+            START="${{ github.event.inputs.start }}"
             PAGE_SIZE='${{ github.event.inputs.page_size }}'
             PAGE_STEP='${{ github.event.inputs.page_step }}'
             MAX_PAGES='${{ github.event.inputs.max_pages }}'
@@ -160,13 +161,13 @@ jobs:
           path_all = base / f"ALL_DIFFS_{run_id}.xlsx"
           path_changes = base / f"ALL_DIFFS_CHANGES_{run_id}.xlsx"
 
-          with pd.ExcelWriter(path_all, engine="xlsxwriter") as writer:
-            out_changes.to_excel(writer, index=False, sheet_name="CHANGES")
-            out_new.to_excel(writer, index=False, sheet_name="NEW")
-            out_removed.to_excel(writer, index=False, sheet_name="REMOVED")
+          with pd.ExcelWriter(path_all, engine="xlsxwriter") as w:
+            out_changes.to_excel(w, index=False, sheet_name="CHANGES")
+            out_new.to_excel(w, index=False, sheet_name="NEW")
+            out_removed.to_excel(w, index=False, sheet_name="REMOVED")
 
-          with pd.ExcelWriter(path_changes, engine="xlsxwriter") as writer:
-            out_changes.to_excel(writer, index=False, sheet_name="CHANGES")
+          with pd.ExcelWriter(path_changes, engine="xlsxwriter") as w:
+            out_changes.to_excel(w, index=False, sheet_name="CHANGES")
 
           print("✓ Generados:", path_all, "y", path_changes)
           PY
@@ -182,59 +183,54 @@ jobs:
           if-no-files-found: warn
           retention-days: 10
 
-      - name: Install Google Drive libs
+      # ───────────────────────────── rclone: instalar ─────────────────────────────
+      - name: Install rclone
         if: always()
         run: |
-          python -m pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+          set -euo pipefail
+          curl -L -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
+          unzip -q rclone.zip
+          sudo mv rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+          rclone version
 
-      - name: Upload to Google Drive (folder + subcarpeta por corrida)
+      # Escribir rclone.conf desde el secret RCLONE_CONFIG (acepta plano o base64)
+      - name: Write rclone.conf from secret
         if: always()
         env:
-          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
         run: |
-          python - << 'PY'
-          import os, json, pathlib, mimetypes
-          from datetime import datetime
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
-          from googleapiclient.http import MediaFileUpload
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          # intenta base64 → si falla, lo guarda tal cual
+          (echo "$RCLONE_CONFIG" | base64 -d > ~/.config/rclone/rclone.conf) || \
+          (echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf)
+          echo "==== rclone remotes ===="
+          rclone listremotes || true
 
-          FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
-          SA_INFO = json.loads(os.environ["SA_JSON"])
-          SCOPES = ["https://www.googleapis.com/auth/drive"]
-          creds = service_account.Credentials.from_service_account_info(SA_INFO, scopes=SCOPES)
-          drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+      # Subir todo out_palacio a Drive
+      # Opción 1: por ID de carpeta (no requiere remote llamado)
+      - name: Upload out_palacio to Drive (by folder ID)
+        if: always() && env.GDRIVE_FOLDER_ID != ''
+        run: |
+          set -euo pipefail
+          if [ -d "out_palacio" ]; then
+            rclone copy "out_palacio" ":drive,root_folder_id=${GDRIVE_FOLDER_ID}:" --create-empty-src-dirs -P
+            echo "✓ Upload con rclone (folder_id=${GDRIVE_FOLDER_ID}) terminado"
+          else
+            echo "⚠️ No existe out_palacio; nada que subir."
+          fi
 
-          def ensure_subfolder(parent_id, name):
-            q = f"'{parent_id}' in parents and name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-            r = drive.files().list(q=q, fields="files(id,name)").execute()
-            if r.get("files"):
-              return r["files"][0]["id"]
-            meta = {"name": name, "parents": [parent_id], "mimeType": "application/vnd.google-apps.folder"}
-            f = drive.files().create(body=meta, fields="id").execute()
-            return f["id"]
-
-          run_id = os.environ.get("GITHUB_RUN_ID", "local")
-          date_slug = datetime.utcnow().strftime("%Y-%m-%d")
-          sub_id = ensure_subfolder(FOLDER_ID, f"{date_slug}_run_{run_id}")
-
-          def upload(path):
-            path = pathlib.Path(path)
-            if not path.exists(): return
-            mtype, _ = mimetypes.guess_type(str(path))
-            media = MediaFileUpload(str(path), mimetype=mtype or "application/octet-stream", resumable=True)
-            meta = {"name": path.name, "parents": [sub_id]}
-            drive.files().create(body=meta, media_body=media, fields="id").execute()
-            print("↑ Subido a Drive:", path)
-
-          base = pathlib.Path("out_palacio")
-          if base.exists():
-            for p in base.rglob("*"):
-              if p.is_file():
-                upload(p)
-
-          print("✓ Upload a Drive finalizado en subcarpeta:", f"{date_slug}_run_{run_id}")
-          PY
+      # Opción 2: si prefieres un remote, por ejemplo "mydrive:", descomenta y ajusta el path
+      # - name: Upload out_palacio to Drive (using remote)
+      #   if: always() && env.GDRIVE_FOLDER_ID == ''
+      #   run: |
+      #     set -euo pipefail
+      #     if [ -d "out_palacio" ]; then
+      #       rclone copy "out_palacio" "mydrive:Scrapper PH/ph" --create-empty-src-dirs -P
+      #       echo "✓ Upload con rclone (remote=mydrive) terminado"
+      #     else
+      #       echo "⚠️ No existe out_palacio; nada que subir."
+      #     fi
 
       - name: Email ONLY CHANGES Excel via Gmail
         if: always()
@@ -262,7 +258,10 @@ jobs:
           msg["From"] = user
           msg["To"] = to
           msg["Subject"] = "[Scraper] Consolidado SOLO CHANGES"
-          msg.set_content("Adjunto el Excel consolidado con la hoja CHANGES (cambios de precio) de esta corrida.")
+          body = "Adjunto el Excel consolidado con la hoja CHANGES (cambios de precio) de esta corrida."
+          if not pathlib.Path(xlsx_path).exists():
+            body = "No hubo hoja CHANGES consolidada. Revisa logs de la corrida."
+          msg.set_content(body)
 
           if pathlib.Path(xlsx_path).exists():
             ctype, _ = mimetypes.guess_type(xlsx_path)
@@ -271,8 +270,6 @@ jobs:
             with open(xlsx_path, "rb") as f:
               msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(xlsx_path))
             print("Adjuntado:", xlsx_path)
-          else:
-            msg.set_content("No hubo hoja CHANGES consolidada. Revisa logs de la corrida.")
 
           cx = smtplib.SMTP(os.environ["EMAIL_HOST"], int(os.environ["EMAIL_PORT"]))
           cx.ehlo(); cx.starttls(context=ssl.create_default_context()); cx.ehlo()
