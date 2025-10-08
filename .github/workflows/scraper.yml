@@ -55,7 +55,8 @@ jobs:
     timeout-minutes: 120
     env:
       # 🔴 Cambia esto por el ID de TU carpeta en Drive
-      GDRIVE_FOLDER_ID: 1l5M_KGzOiQt20x8Ht7Jmp1nGTeoKRXyX
+      GDRIVE_FOLDER_ID: 1WjDwG1RRg8dqh9gqMe6ztRU4zZ9jXgMK
+
 
     steps:
       - name: Checkout
