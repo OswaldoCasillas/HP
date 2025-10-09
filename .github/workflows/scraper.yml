@@ -2,7 +2,7 @@ name: Palacio Scraper (RAM + Email + Drive)
 
 on:
   schedule:
-    # 3:00 AM America/Mexico_City (UTC-6 invierno ≈ 09:00Z, UTC-5 verano ≈ 08:00Z)
+    # 3:00 AM America/Mexico_City (UTC-6 ≈ 09:00Z, UTC-5 ≈ 08:00Z)
     - cron: "0 9 * * *"   # Invierno
     - cron: "0 8 * * *"   # Verano
   workflow_dispatch:
@@ -41,17 +41,16 @@ on:
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6h máx por job
+    timeout-minutes: 360
     env:
-      # Email (de tus secrets)
-      EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
-      EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
-      EMAIL_USER: ${{ secrets.EMAIL_USER }}
-      EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-      EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
+      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
+      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
       EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
-      # Salida local temporal que subiremos a Drive
       SAVE_DIR: /tmp/palacio_out
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,25 +65,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests pandas beautifulsoup4 xlsxwriter
 
-      - name: Crear carpeta de salida local
+      - name: Crear carpeta de salida
         run: mkdir -p "$SAVE_DIR"
 
       - name: Ejecutar scraper
-        id: runit
         shell: bash
         run: |
           set -euo pipefail
-          # Construir argumentos según inputs
           args=()
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             if [[ "${{ inputs.run_all }}" == "true" ]]; then
               args+=(--all)
             else
-              if [[ -n "${{ inputs.category }}" ]]; then
-                args+=(-c "${{ inputs.category }}")
-              else
-                echo "run_all=false pero no diste 'category'"; exit 1
-              fi
+              [[ -n "${{ inputs.category }}" ]] || { echo "run_all=false pero sin 'category'"; exit 1; }
+              args+=(-c "${{ inputs.category }}")
             fi
             [[ -n "${{ inputs.start }}"     ]] && args+=(--start "${{ inputs.start }}")
             [[ -n "${{ inputs.page_size }}" ]] && args+=(--page-size "${{ inputs.page_size }}")
@@ -92,20 +86,18 @@ jobs:
             [[ -n "${{ inputs.max_pages }}" ]] && args+=(--max-pages "${{ inputs.max_pages }}")
             [[ -n "${{ inputs.highlight }}" ]] && args+=(--highlight "${{ inputs.highlight }}")
           else
-            # Schedule: siempre TODAS
             args+=(--all)
           fi
-
           echo "Args: ${args[@]-<none>}"
           python palacio_category_snapshot_ramonly.py "${args[@]}"
 
-      # ───────────── Rclone: subir a Google Drive ─────────────
+      # ───────── rclone: subir a Google Drive ─────────
       - name: Instalar rclone
         run: |
           sudo apt-get update
           sudo apt-get install -y rclone
 
-      - name: Configurar rclone (usa RCLONE_CONFIG si existe; si no, Service Account JSON)
+      - name: Configurar rclone (usa RCLONE_CONFIG o Service Account JSON)
         shell: bash
         env:
           RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
@@ -119,26 +111,23 @@ jobs:
             printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
           else
             echo "Construyendo rclone.conf con Service Account JSON"
-            if [[ -z "${SA_JSON:-}" || -z "${GDRIVE_FOLDER_ID:-}" ]]; then
-              echo "Faltan GDRIVE_SERVICE_ACCOUNT_JSON o GDRIVE_FOLDER_ID" >&2
-              exit 1
-            fi
-            printf '%s\n' "$SA_JSON" > sa.json
-            cat > ~/.config/rclone/rclone.conf <<EOF
-[gdrive]
-type = drive
-scope = drive
-root_folder_id = ${GDRIVE_FOLDER_ID}
-service_account_file = ${GITHUB_WORKSPACE}/sa.json
-EOF
+            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan GDRIVE_SERVICE_ACCOUNT_JSON o GDRIVE_FOLDER_ID"; exit 1; }
+            printf '%s' "$SA_JSON" > "$GITHUB_WORKSPACE/sa.json"
+            {
+              echo "[gdrive]"
+              echo "type = drive"
+              echo "scope = drive"
+              echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
+              echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
+            } > ~/.config/rclone/rclone.conf
           fi
-          echo "rclone version:"; rclone version
-          echo "rclone remotes:"; rclone listremotes
+          rclone version
+          rclone listremotes
 
-      - name: Subir XLSX a Drive (rclone copy)
+      - name: Subir XLSX a Drive
         run: |
           if compgen -G "$SAVE_DIR/*.xlsx" > /dev/null; then
             rclone copy "$SAVE_DIR" gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
           else
-            echo "No se encontraron XLSX en $SAVE_DIR (quizá la corrida no produjo archivos)."
+            echo "No hay XLSX en $SAVE_DIR"
           fi
