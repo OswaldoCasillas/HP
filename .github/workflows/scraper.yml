@@ -4,7 +4,6 @@ on:
   schedule:
     # 3:00 AM America/Mexico_City (UTC-6 ≈ 09:00Z, UTC-5 ≈ 08:00Z)
     - cron: "0 9 * * *"   # Invierno
-    - cron: "0 8 * * *"   # Verano
   workflow_dispatch:
     inputs:
       run_all:
