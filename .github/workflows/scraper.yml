@@ -1,130 +1,144 @@
-name: Palacio Scraper (RAM-only email)
+name: Palacio Scraper (RAM + Email + Drive)
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # 02:00 y 14:00 UTC de tu repo
+    # 3:00 AM America/Mexico_City (UTC-6 invierno ≈ 09:00Z, UTC-5 verano ≈ 08:00Z)
+    - cron: "0 9 * * *"   # Invierno
+    - cron: "0 8 * * *"   # Verano
   workflow_dispatch:
     inputs:
       run_all:
-        description: "Correr TODAS las categorías?"
-        type: boolean
-        default: true
-      category:
-        description: "Si run_all=false, escribe la categoría exacta"
+        description: "Correr TODAS las categorías"
         required: false
+        default: "true"
+        type: choice
+        options: ["true","false"]
+      category:
+        description: "Si run_all=false, escribe una categoría (de tu script)"
+        required: false
+        default: ""
       start:
         description: "start (opcional)"
         required: false
+        default: ""
       page_size:
-        description: "page-size (opcional)"
+        description: "page_size (opcional)"
         required: false
+        default: ""
       page_step:
-        description: "page-step (opcional)"
+        description: "page_step (opcional)"
         required: false
+        default: ""
       max_pages:
-        description: "max-pages (opcional)"
+        description: "max_pages (opcional)"
         required: false
+        default: ""
       highlight:
-        description: "highlight % (opcional)"
+        description: "Umbral descuento (default del script)"
         required: false
-
-concurrency:
-  group: palacio-scraper-${{ github.ref }}
-  cancel-in-progress: true
+        default: ""
 
 jobs:
-  # --- TODAS las categorías por matrix ---
-  all:
-    if: |
-      github.event_name == 'schedule' ||
-      (github.event_name == 'workflow_dispatch' && inputs.run_all == 'true')
+  run-scraper:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        category:
-          - ofertas
-          - electronica
-          - deportes
-          - gourmet
-          - casapalacio
-          - nuevos-productos
-          - mujer
-          - productos-liquidacion
-          - hombre
-          - calzado
-          - mujer-multimarcas
-          - hombre-multimarcas
-          - electronica-tablets
-          - disenadores
-          - hogar
-          - juguetes
-          - categorias
-          - salas
-          - tendencias
-          - "más vendido"
+    timeout-minutes: 360  # 6h máx por job
+    env:
+      # Email (de tus secrets)
+      EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+      EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+      EMAIL_USER: ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
+      # Salida local temporal que subiremos a Drive
+      SAVE_DIR: /tmp/palacio_out
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Python
+      - name: Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Instalar deps
+      - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas beautifulsoup4 xlsxwriter
 
-      - name: Variables de correo
-        run: |
-          echo "EMAIL_HOST=${{ secrets.EMAIL_HOST }}" >> $GITHUB_ENV
-          echo "EMAIL_PORT=${{ secrets.EMAIL_PORT }}" >> $GITHUB_ENV
-          echo "EMAIL_USER=${{ secrets.EMAIL_USER }}" >> $GITHUB_ENV
-          echo "EMAIL_PASS=${{ secrets.EMAIL_PASS }}" >> $GITHUB_ENV
-          echo "EMAIL_TO=${{ secrets.EMAIL_TO }}"       >> $GITHUB_ENV
+      - name: Crear carpeta de salida local
+        run: mkdir -p "$SAVE_DIR"
 
-      - name: Ejecutar categoría (matrix)
+      - name: Ejecutar scraper
+        id: runit
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Construir argumentos según inputs
+          args=()
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.run_all }}" == "true" ]]; then
+              args+=(--all)
+            else
+              if [[ -n "${{ inputs.category }}" ]]; then
+                args+=(-c "${{ inputs.category }}")
+              else
+                echo "run_all=false pero no diste 'category'"; exit 1
+              fi
+            fi
+            [[ -n "${{ inputs.start }}"     ]] && args+=(--start "${{ inputs.start }}")
+            [[ -n "${{ inputs.page_size }}" ]] && args+=(--page-size "${{ inputs.page_size }}")
+            [[ -n "${{ inputs.page_step }}" ]] && args+=(--page-step "${{ inputs.page_step }}")
+            [[ -n "${{ inputs.max_pages }}" ]] && args+=(--max-pages "${{ inputs.max_pages }}")
+            [[ -n "${{ inputs.highlight }}" ]] && args+=(--highlight "${{ inputs.highlight }}")
+          else
+            # Schedule: siempre TODAS
+            args+=(--all)
+          fi
+
+          echo "Args: ${args[@]-<none>}"
+          python palacio_category_snapshot_ramonly.py "${args[@]}"
+
+      # ───────────── Rclone: subir a Google Drive ─────────────
+      - name: Instalar rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Configurar rclone (usa RCLONE_CONFIG si existe; si no, Service Account JSON)
+        shell: bash
         env:
-          CAT: ${{ matrix.category }}
+          RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
+          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          python palacio_category_snapshot_ramonly.py \
-            -c "$CAT" \
-            $([ -n "${{ inputs.start }}" ] && echo --start ${{ inputs.start }}) \
-            $([ -n "${{ inputs.page_size }}" ] && echo --page-size ${{ inputs.page_size }}) \
-            $([ -n "${{ inputs.page_step }}" ] && echo --page-step ${{ inputs.page_step }}) \
-            $([ -n "${{ inputs.max_pages }}" ] && echo --max-pages ${{ inputs.max_pages }}) \
-            $([ -n "${{ inputs.highlight }}" ] && echo --highlight ${{ inputs.highlight }})
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
+            echo "Usando rclone.conf del secret RCLONE_CONFIG"
+            printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
+          else
+            echo "Construyendo rclone.conf con Service Account JSON"
+            if [[ -z "${SA_JSON:-}" || -z "${GDRIVE_FOLDER_ID:-}" ]]; then
+              echo "Faltan GDRIVE_SERVICE_ACCOUNT_JSON o GDRIVE_FOLDER_ID" >&2
+              exit 1
+            fi
+            printf '%s\n' "$SA_JSON" > sa.json
+            cat > ~/.config/rclone/rclone.conf <<EOF
+[gdrive]
+type = drive
+scope = drive
+root_folder_id = ${GDRIVE_FOLDER_ID}
+service_account_file = ${GITHUB_WORKSPACE}/sa.json
+EOF
+          fi
+          echo "rclone version:"; rclone version
+          echo "rclone remotes:"; rclone listremotes
 
-  # --- UNA sola categoría manual ---
-  one:
-    if: github.event_name == 'workflow_dispatch' && inputs.run_all != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Instalar deps
+      - name: Subir XLSX a Drive (rclone copy)
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter
-      - name: Variables de correo
-        run: |
-          echo "EMAIL_HOST=${{ secrets.EMAIL_HOST }}" >> $GITHUB_ENV
-          echo "EMAIL_PORT=${{ secrets.EMAIL_PORT }}" >> $GITHUB_ENV
-          echo "EMAIL_USER=${{ secrets.EMAIL_USER }}" >> $GITHUB_ENV
-          echo "EMAIL_PASS=${{ secrets.EMAIL_PASS }}" >> $GITHUB_ENV
-          echo "EMAIL_TO=${{ secrets.EMAIL_TO }}"       >> $GITHUB_ENV
-      - name: Ejecutar una categoría
-        run: |
-          python palacio_category_snapshot_ramonly.py \
-            -c "${{ inputs.category }}" \
-            $([ -n "${{ inputs.start }}" ] && echo --start ${{ inputs.start }}) \
-            $([ -n "${{ inputs.page_size }}" ] && echo --page-size ${{ inputs.page_size }}) \
-            $([ -n "${{ inputs.page_step }}" ] && echo --page-step ${{ inputs.page_step }}) \
-            $([ -n "${{ inputs.max_pages }}" ] && echo --max-pages ${{ inputs.max_pages }}) \
-            $([ -n "${{ inputs.highlight }}" ] && echo --highlight ${{ inputs.highlight }})
+          if compgen -G "$SAVE_DIR/*.xlsx" > /dev/null; then
+            rclone copy "$SAVE_DIR" gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          else
+            echo "No se encontraron XLSX en $SAVE_DIR (quizá la corrida no produjo archivos)."
+          fi
