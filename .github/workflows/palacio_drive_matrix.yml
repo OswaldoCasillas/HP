@@ -1,13 +1,17 @@
-name: Palacio Scraper (Drive + Emails por categoría + Resumen CHANGES)
+name: Palacio Scraper (Drive-only + Email CHANGES)
 
 on:
   schedule:
-    # 08:00 y 20:00 UTC ≈ 02:00 y 14:00 CDMX
-    - cron: "0 8,20 * * *"
+    - cron: "0 8,20 * * *"   # 02:00 y 14:00 CDMX aprox.
   workflow_dispatch:
     inputs:
+      run_all:
+        description: "Ejecutar TODAS las categorías"
+        type: boolean
+        default: true
+        required: true
       category:
-        description: "Categoría única (dejar vacío para todas en cron). Ej: juguetes"
+        description: "Categoría única (si run_all = false). Ej: juguetes"
         type: string
         required: false
         default: ""
@@ -32,7 +36,7 @@ on:
         required: false
         default: ""
       highlight:
-        description: "Umbral % highlight"
+        description: "Umbral % para resaltar"
         type: string
         required: false
         default: "51"
@@ -44,40 +48,13 @@ concurrency:
   group: palacio-scraper
   cancel-in-progress: false
 
-env:
-  PY_VERSION: "3.11"
-
 jobs:
-  # ========================== A) MATRIZ (todas) ==========================
-  scrape_all:
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.category == '' }}
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      max-parallel: 6
-      matrix:
-        category:
-          - ofertas
-          - electronica
-          - deportes
-          - gourmet
-          - casapalacio
-          - nuevos-productos
-          - mujer
-          - productos-liquidacion
-          - hombre
-          - calzado
-          - mujer-multimarcas
-          - hombre-multimarcas
-          - electronica-tablets
-          - disenadores
-          - hogar
-          - juguetes
-          - categorias
-          - salas
-          - tendencias
-          - mas-vendido
+    timeout-minutes: 180
+    env:
+      OUT_TMP_DIR: /tmp/ph          # salida efímera
+      DRIVE_DEST: mydrive:ph        # tu remoto rclone y carpeta en Drive
 
     steps:
       - name: Checkout
@@ -86,9 +63,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PY_VERSION }}
+          python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
           python -m pip install -U pip
           if [ -f requirements.txt ]; then
@@ -97,317 +74,82 @@ jobs:
             pip install requests pandas beautifulsoup4 xlsxwriter openpyxl pyarrow
           fi
 
-      - name: Run category
-        env:
-          CAT:        ${{ matrix.category }}
-          START:      ${{ github.event.inputs.start }}
-          PAGE_SIZE:  ${{ github.event.inputs.page_size }}
-          PAGE_STEP:  ${{ github.event.inputs.page_step }}
-          MAX_PAGES:  ${{ github.event.inputs.max_pages }}
-          HIGHLIGHT:  ${{ github.event.inputs.highlight }}
+      - name: Prepare temp dir
         run: |
-          set -euo pipefail
-          ARGS="-c ${CAT}"
-          [[ -n "${START}" ]] && ARGS+=" --start ${START}"
-          [[ -n "${PAGE_SIZE}" ]] && ARGS+=" --page-size ${PAGE_SIZE}"
-          [[ -n "${PAGE_STEP}" ]] && ARGS+=" --page-step ${PAGE_STEP}"
-          [[ -n "${MAX_PAGES}" ]] && ARGS+=" --max-pages ${MAX_PAGES}"
-          [[ -n "${HIGHLIGHT}" ]] && ARGS+=" --highlight ${HIGHLIGHT}"
-          echo "▶ python palacio_category_snapshot.py ${ARGS}"
-          python palacio_category_snapshot.py ${ARGS}
-
-      - name: Email XLSX of this category (no zip)
-        if: always()
-        env:
-          EMAIL_HOST: smtp.gmail.com
-          EMAIL_PORT: "587"
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
-          CAT:        ${{ matrix.category }}
-        run: |
-          python - << 'PY'
-          import os, smtplib, ssl, mimetypes, pathlib, glob
-          from email.message import EmailMessage
-
-          user = os.environ.get("EMAIL_USER","")
-          pwd  = os.environ.get("EMAIL_PASS","")
-          to   = os.environ.get("EMAIL_TO","")
-          cat  = os.environ.get("CAT","")
-
-          if not user or not pwd or not to:
-            print("⚠️ Falta EMAIL_USER/EMAIL_PASS/EMAIL_TO; no se envía correo.")
-            raise SystemExit(0)
-
-          base = pathlib.Path("out_palacio")
-          files = sorted(glob.glob(str(base / f"{cat}" / "**" / "*.xlsx"), recursive=True))
-          if not files:
-            print(f"ℹ️ No hay XLSX para {cat}.")
-            raise SystemExit(0)
-
-          def size_mb(p): return os.path.getsize(p)/1024/1024
-          batch, batch_sz = [], 0.0
-          batches = []
-          for f in files:
-            s = size_mb(f)
-            if batch and (batch_sz + s > 20.0):
-              batches.append(batch)
-              batch, batch_sz = [], 0.0
-            batch.append(f); batch_sz += s
-          if batch: batches.append(batch)
-
-          for i, group in enumerate(batches, 1):
-            msg = EmailMessage()
-            msg["From"] = user
-            msg["To"] = to
-            msg["Subject"] = f"[Scraper] XLSX {cat} (lote {i}/{len(batches)})"
-            msg.set_content(f"Adjunto XLSX generados para la categoría {cat}. Lote {i}/{len(batches)}.")
-
-            for path in group:
-              ctype, _ = mimetypes.guess_type(path)
-              if not ctype:
-                ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-              maintype, subtype = ctype.split("/", 1)
-              with open(path, "rb") as f:
-                msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
-              print("Adjuntado:", path)
-
-            cx = smtplib.SMTP(os.environ["EMAIL_HOST"], int(os.environ["EMAIL_PORT"]))
-            cx.ehlo(); cx.starttls(context=ssl.create_default_context()); cx.ehlo()
-            cx.login(user, pwd)
-            cx.send_message(msg)
-            cx.quit()
-            print(f"📧 Enviado lote {i}/{len(batches)} para {cat}")
-          PY
-
-      - name: Upload artifact (out_palacio for this category)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: out_palacio-${{ matrix.category }}-${{ github.run_id }}
-          path: out_palacio/**
-          if-no-files-found: warn
-          retention-days: 10
+          rm -rf "$OUT_TMP_DIR"
+          mkdir -p "$OUT_TMP_DIR"
 
       - name: Install rclone
-        if: always()
         run: |
-          set -euo pipefail
           curl -L -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip -q rclone.zip
           sudo mv rclone-*-linux-amd64/rclone /usr/local/bin/rclone
           rclone version
 
       - name: Write rclone.conf from secret
-        if: always()
         env:
           RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
         run: |
-          set -euo pipefail
           mkdir -p ~/.config/rclone
           (echo "$RCLONE_CONFIG" | base64 -d > ~/.config/rclone/rclone.conf) || \
           (echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf)
+          echo "==== Remotos detectados ===="
           rclone listremotes || true
-
-      - name: Upload to Drive via rclone (per-category)
-        if: always()
-        env:
-          RCLONE_REMOTE: ${{ secrets.RCLONE_REMOTE }}
-        run: |
-          set -euo pipefail
-          REMOTE="${RCLONE_REMOTE:-mydrive:}"
-          if [ -d "out_palacio" ]; then
-            # Ej: mydrive:Scrapper-PH/out_palacio/<todo lo generado>
-            rclone copy "out_palacio" "${REMOTE}Scrapper-PH/out_palacio" --create-empty-src-dirs -P
-            echo "✓ Upload terminado a ${REMOTE}Scrapper-PH/out_palacio"
-          else
-            echo "⚠️ No existe out_palacio; nada que subir."
+          # Validación de 'mydrive:'
+          if ! rclone listremotes | grep -q "^mydrive:" ; then
+            echo "❌ Falta el remoto 'mydrive:' en tu RCLONE_CONFIG"
+            exit 1
           fi
 
-  # ========================== B) UNA SOLA (manual) ==========================
-  scrape_one:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.category != '' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PY_VERSION }}
-
-      - name: Install dependencies
+      - name: (Pull) Traer histórico desde Drive → /tmp/ph
         run: |
-          python -m pip install -U pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install requests pandas beautifulsoup4 xlsxwriter openpyxl pyarrow
-          fi
+          rclone mkdir "${DRIVE_DEST}" || true
+          # Trae todo lo que haya (para comparar con el snapshot previo)
+          rclone copy "${DRIVE_DEST}" "${OUT_TMP_DIR}" --create-empty-src-dirs -P || true
 
-      - name: Run single category
+      - name: Run scraper (disco + diffs)
         env:
-          CAT:        ${{ github.event.inputs.category }}
-          START:      ${{ github.event.inputs.start }}
-          PAGE_SIZE:  ${{ github.event.inputs.page_size }}
-          PAGE_STEP:  ${{ github.event.inputs.page_step }}
-          MAX_PAGES:  ${{ github.event.inputs.max_pages }}
-          HIGHLIGHT:  ${{ github.event.inputs.highlight }}
+          OUT_BASE_DIR: ${{ env.OUT_TMP_DIR }}
+        shell: bash
         run: |
           set -euo pipefail
-          ARGS="-c ${CAT}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            RUN_ALL="${{ github.event.inputs.run_all }}"
+            CATEGORY="${{ github.event.inputs.category }}"
+            START="${{ github.event.inputs.start }}"
+            PAGE_SIZE='${{ github.event.inputs.page_size }}'
+            PAGE_STEP='${{ github.event.inputs.page_step }}'
+            MAX_PAGES='${{ github.event.inputs.max_pages }}'
+            HIGHLIGHT='${{ github.event.inputs.highlight }}'
+          else
+            RUN_ALL="true"; CATEGORY=""; START=""; PAGE_SIZE=""; PAGE_STEP=""; MAX_PAGES=""; HIGHLIGHT="51"
+          fi
+
+          ARGS=""
+          if [[ "${RUN_ALL}" == "true" || "${RUN_ALL}" == "True" ]]; then
+            ARGS+=" --all"
+          else
+            if [[ -z "${CATEGORY}" ]]; then
+              echo "❌ Debes indicar 'category' cuando run_all=false."
+              exit 1
+            fi
+            ARGS+=" -c ${CATEGORY}"
+          fi
           [[ -n "${START}" ]] && ARGS+=" --start ${START}"
           [[ -n "${PAGE_SIZE}" ]] && ARGS+=" --page-size ${PAGE_SIZE}"
           [[ -n "${PAGE_STEP}" ]] && ARGS+=" --page-step ${PAGE_STEP}"
           [[ -n "${MAX_PAGES}" ]] && ARGS+=" --max-pages ${MAX_PAGES}"
           [[ -n "${HIGHLIGHT}" ]] && ARGS+=" --highlight ${HIGHLIGHT}"
+
           echo "▶ python palacio_category_snapshot.py ${ARGS}"
           python palacio_category_snapshot.py ${ARGS}
-
-      - name: Email XLSX of this category (no zip)
-        if: always()
-        env:
-          EMAIL_HOST: smtp.gmail.com
-          EMAIL_PORT: "587"
-          EMAIL_USER: ${{ secrets.EMAIL_USER }}
-          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
-          CAT:        ${{ github.event.inputs.category }}
-        run: |
-          python - << 'PY'
-          import os, smtplib, ssl, mimetypes, pathlib, glob
-          from email.message import EmailMessage
-
-          user = os.environ.get("EMAIL_USER","")
-          pwd  = os.environ.get("EMAIL_PASS","")
-          to   = os.environ.get("EMAIL_TO","")
-          cat  = os.environ.get("CAT","")
-
-          if not user or not pwd or not to:
-            print("⚠️ Falta EMAIL_USER/EMAIL_PASS/EMAIL_TO; no se envía correo.")
-            raise SystemExit(0)
-
-          base = pathlib.Path("out_palacio")
-          files = sorted(glob.glob(str(base / f"{cat}" / "**" / "*.xlsx"), recursive=True))
-          if not files:
-            print(f"ℹ️ No hay XLSX para {cat}.")
-            raise SystemExit(0)
-
-          def size_mb(p): return os.path.getsize(p)/1024/1024
-          batch, batch_sz = [], 0.0
-          batches = []
-          for f in files:
-            s = size_mb(f)
-            if batch and (batch_sz + s > 20.0):
-              batches.append(batch)
-              batch, batch_sz = [], 0.0
-            batch.append(f); batch_sz += s
-          if batch: batches.append(batch)
-
-          for i, group in enumerate(batches, 1):
-            msg = EmailMessage()
-            msg["From"] = user
-            msg["To"] = to
-            msg["Subject"] = f"[Scraper] XLSX {cat} (lote {i}/{len(batches)})"
-            msg.set_content(f"Adjunto XLSX generados para la categoría {cat}. Lote {i}/{len(batches)}.")
-
-            for path in group:
-              ctype, _ = mimetypes.guess_type(path)
-              if not ctype:
-                ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-              maintype, subtype = ctype.split("/", 1)
-              with open(path, "rb") as f:
-                msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(path))
-              print("Adjuntado:", path)
-
-            cx = smtplib.SMTP(os.environ["EMAIL_HOST"], int(os.environ["EMAIL_PORT"]))
-            cx.ehlo(); cx.starttls(context=ssl.create_default_context()); cx.ehlo()
-            cx.login(user, pwd)
-            cx.send_message(msg)
-            cx.quit()
-            print(f"📧 Enviado lote {i}/{len(batches)} para {cat}")
-          PY
-
-      - name: Upload artifact (out_palacio for this category)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: out_palacio-${{ github.event.inputs.category }}-${{ github.run_id }}
-          path: out_palacio/**
-          if-no-files-found: warn
-          retention-days: 10
-
-      - name: Install rclone
-        if: always()
-        run: |
-          set -euo pipefail
-          curl -L -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
-          unzip -q rclone.zip
-          sudo mv rclone-*-linux-amd64/rclone /usr/local/bin/rclone
-          rclone version
-
-      - name: Write rclone.conf from secret
-        if: always()
-        env:
-          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.config/rclone
-          (echo "$RCLONE_CONFIG" | base64 -d > ~/.config/rclone/rclone.conf) || \
-          (echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf)
-          rclone listremotes || true
-
-      - name: Upload to Drive via rclone (single category)
-        if: always()
-        env:
-          RCLONE_REMOTE: ${{ secrets.RCLONE_REMOTE }}
-        run: |
-          set -euo pipefail
-          REMOTE="${RCLONE_REMOTE:-mydrive:}"
-          if [ -d "out_palacio" ]; then
-            rclone copy "out_palacio" "${REMOTE}Scrapper-PH/out_palacio" --create-empty-src-dirs -P
-            echo "✓ Upload terminado a ${REMOTE}Scrapper-PH/out_palacio"
-          else
-            echo "⚠️ No existe out_palacio; nada que subir."
-          fi
-
-  # ========================== C) CONSOLIDACIÓN ==========================
-  consolidate:
-    needs: [scrape_all, scrape_one]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: .
-          merge-multiple: true
-
-      - name: Show tree
-        run: |
-          echo "Contenido descargado:"
-          ls -R
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PY_VERSION }}
-
-      - name: Install deps (consolidation)
-        run: |
-          python -m pip install -U pip
-          pip install pandas openpyxl xlsxwriter
 
       - name: Build consolidated Excels (ALL & CHANGES-only)
+        if: always()
         run: |
           python - << 'PY'
           import pandas as pd, glob, os, pathlib
-          base = pathlib.Path("out_palacio")
+          base = pathlib.Path(os.environ.get("OUT_TMP_DIR","/tmp/ph"))
           files = glob.glob(str(base / "**/*_snapshot_*.xlsx"), recursive=True)
 
           def read_sheet(path, sheet):
@@ -418,7 +160,6 @@ jobs:
             if df is None or df.empty or (set(df.columns) == {"info"}):
               return None
             parts = pathlib.Path(path).parts
-            # out_palacio/<categoria>/<YYYY-MM>/<file.xlsx>
             cat = parts[-3] if len(parts) >= 3 else ""
             df.insert(0, "category", cat)
             df.insert(1, "snapshot_file", os.path.basename(path))
@@ -453,90 +194,93 @@ jobs:
           print("✓ Generados:", path_all, "y", path_changes)
           PY
 
-      - name: Upload consolidated artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ALL_DIFFS-${{ github.run_id }}
-          path: |
-            out_palacio/ALL_DIFFS_${{ github.run_id }}.xlsx
-            out_palacio/ALL_DIFFS_CHANGES_${{ github.run_id }}.xlsx
-          if-no-files-found: warn
-          retention-days: 10
-
-      - name: Install rclone
+      - name: (Push) Subir /tmp/ph completo a Drive
+        if: always()
         run: |
-          set -euo pipefail
-          curl -L -o rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
-          unzip -q rclone.zip
-          sudo mv rclone-*-linux-amd64/rclone /usr/local/bin/rclone
-          rclone version
+          rclone copy "${OUT_TMP_DIR}" "${DRIVE_DEST}" --create-empty-src-dirs -P
 
-      - name: Write rclone.conf from secret
-        env:
-          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.config/rclone
-          (echo "$RCLONE_CONFIG" | base64 -d > ~/.config/rclone/rclone.conf) || \
-          (echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf)
-          rclone listremotes || true
-
-      - name: Upload consolidated to Drive (rclone)
-        env:
-          RCLONE_REMOTE: ${{ secrets.RCLONE_REMOTE }}
-        run: |
-          set -euo pipefail
-          REMOTE="${RCLONE_REMOTE:-mydrive:}"
-          if [ -d "out_palacio" ]; then
-            rclone copy "out_palacio/ALL_DIFFS_${{ github.run_id }}.xlsx"        "${REMOTE}Scrapper-PH/consolidados" -P || true
-            rclone copy "out_palacio/ALL_DIFFS_CHANGES_${{ github.run_id }}.xlsx" "${REMOTE}Scrapper-PH/consolidados" -P || true
-            echo "✓ Consolidado subido a ${REMOTE}Scrapper-PH/consolidados"
-          else
-            echo "⚠️ No existe out_palacio; nada que subir."
-          fi
-
-      - name: Email ONLY CHANGES Excel
+      - name: Email cada XLSX de categoría (sin ZIPs)
+        if: always()
         env:
           EMAIL_HOST: smtp.gmail.com
           EMAIL_PORT: "587"
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+          OUT_TMP_DIR: ${{ env.OUT_TMP_DIR }}
+        run: |
+          python - << 'PY'
+          import os, glob, smtplib, ssl, mimetypes, pathlib
+          from email.message import EmailMessage
+
+          user = os.environ["EMAIL_USER"]; pwd=os.environ["EMAIL_PASS"]; to=os.environ["EMAIL_TO"]
+          base = pathlib.Path(os.environ["OUT_TMP_DIR"])
+          files = sorted(glob.glob(str(base / "**/*_snapshot_*.xlsx"), recursive=True))
+          if not files:
+            print("No hay XLSX por categoría para enviar."); raise SystemExit(0)
+
+          def send_one(fpath):
+            msg = EmailMessage()
+            msg["From"] = user
+            msg["To"] = to
+            msg["Subject"] = "[Scraper] Snapshot categoría"
+            msg.set_content(f"Adjunto snapshot: {os.path.basename(fpath)}")
+            ctype, _ = mimetypes.guess_type(fpath)
+            if not ctype: ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            maintype, subtype = ctype.split("/",1)
+            with open(fpath, "rb") as f:
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(fpath))
+            cx = smtplib.SMTP(os.environ["EMAIL_HOST"], int(os.environ["EMAIL_PORT"]))
+            cx.ehlo(); cx.starttls(context=ssl.create_default_context()); cx.ehlo()
+            cx.login(user, pwd); cx.send_message(msg); cx.quit()
+            print("📧 Enviado:", fpath)
+
+          for f in files:
+            try: send_one(f)
+            except Exception as e: print("⚠️ Falló envío", f, e)
+
+          PY
+
+      - name: Email consolidado SOLO CHANGES
+        if: always()
+        env:
+          EMAIL_HOST: smtp.gmail.com
+          EMAIL_PORT: "587"
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+          OUT_TMP_DIR: ${{ env.OUT_TMP_DIR }}
         run: |
           python - << 'PY'
           import os, smtplib, ssl, mimetypes, pathlib
           from email.message import EmailMessage
-          run_id = os.environ.get("GITHUB_RUN_ID")
-          xlsx_path = f"out_palacio/ALL_DIFFS_CHANGES_{run_id}.xlsx"
-          user = os.environ.get("EMAIL_USER","")
-          pwd  = os.environ.get("EMAIL_PASS","")
-          to   = os.environ.get("EMAIL_TO","")
 
-          if not user or not pwd or not to:
-            print("⚠️ Falta EMAIL_USER/EMAIL_PASS/EMAIL_TO; no se envía correo.")
-            raise SystemExit(0)
+          run_id = os.environ.get("GITHUB_RUN_ID","")
+          xlsx = pathlib.Path(os.environ["OUT_TMP_DIR"]) / f"ALL_DIFFS_CHANGES_{run_id}.xlsx"
+          user=os.environ["EMAIL_USER"]; pwd=os.environ["EMAIL_PASS"]; to=os.environ["EMAIL_TO"]
 
           msg = EmailMessage()
-          msg["From"] = user
-          msg["To"] = to
+          msg["From"] = user; msg["To"] = to
           msg["Subject"] = "[Scraper] Consolidado SOLO CHANGES"
-          body = "Adjunto Excel consolidado con CHANGES de esta corrida."
-          if not pathlib.Path(xlsx_path).exists():
-            body = "No hubo CHANGES consolidado. Revisa logs."
+          body = "Adjunto el Excel con los cambios de precio agregados de todas las categorías."
+          if not xlsx.exists():
+            body = "No se generó consolidado CHANGES. Revisa los logs."
           msg.set_content(body)
 
-          if pathlib.Path(xlsx_path).exists():
-            ctype, _ = mimetypes.guess_type(xlsx_path)
+          if xlsx.exists():
+            ctype, _ = mimetypes.guess_type(str(xlsx))
             if not ctype: ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            maintype, subtype = ctype.split("/", 1)
-            with open(xlsx_path, "rb") as f:
-              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(xlsx_path))
-            print("Adjuntado:", xlsx_path)
+            maintype, subtype = ctype.split("/",1)
+            with open(xlsx, "rb") as f:
+              msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=xlsx.name)
+            print("Adjuntado:", xlsx)
 
           cx = smtplib.SMTP(os.environ["EMAIL_HOST"], int(os.environ["EMAIL_PORT"]))
           cx.ehlo(); cx.starttls(context=ssl.create_default_context()); cx.ehlo()
-          cx.login(user, pwd)
-          cx.send_message(msg)
-          cx.quit()
+          cx.login(user, pwd); cx.send_message(msg); cx.quit()
           print("📧 Enviado SOLO CHANGES")
           PY
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf "$OUT_TMP_DIR" || true
