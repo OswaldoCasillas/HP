@@ -1,13 +1,12 @@
 # palacio_category_snapshot_ramonly.py
-# Scraper Palacio → genera XLSX en memoria y lo ENVÍA por correo (no escribe a disco).
-# - Corre 1 categoría o TODAS (--all) y manda 2 tipos de correos:
-#   1) Por categoría (adjunta su XLSX).
-#   2) Resumen final de la corrida --all (sin adjuntos).
+# Scraper Palacio → genera XLSX en memoria, lo ENVÍA por correo y (opcional) lo guarda en disco (SAVE_DIR).
+# - Corre 1 categoría o TODAS (--all).
 # - Reintentos CF (520–524) y 429 Retry-After.
 # - Resaltado multicolor en Excel por bandas de descuento.
-# - EMAIL_* se leen de variables de entorno (usa GitHub Secrets).
+# - Múltiples destinatarios: EMAIL_TO acepta coma o punto y coma.
 
 import os, re, io, math, json, time, random, argparse, smtplib, html
+from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 from email.message import EmailMessage
@@ -18,26 +17,29 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ─────────── Email (por entorno, con defaults seguros) ───────────
+# ───────────────────── Email (desde secrets/entorno) ─────────────────────
 EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_USER = os.getenv("EMAIL_USER", "")
 EMAIL_PASS = os.getenv("EMAIL_PASS", "")
 EMAIL_TO   = os.getenv("EMAIL_TO", "")
-EMAIL_TO_LIST = [e.strip() for e in re.split(r"[;,]", EMAIL_TO) if e.strip()]
 EMAIL_DEBUG = os.getenv("EMAIL_DEBUG", "0") not in ("", "0", "false", "False", "FALSE")
 
-def send_email(subject: str, body: str, to_addr, attachments=None):
-    if not EMAIL_USER or not EMAIL_PASS:
-        print("⚠️ Falta EMAIL_USER/EMAIL_PASS: no se envió correo.")
+# Carpeta opcional para guardar XLSX (el workflow la define como /tmp/palacio_out)
+SAVE_DIR = os.getenv("SAVE_DIR", "").strip()  # si vacío → no guarda en disco
+
+def send_email(subject: str, body: str, to_addr: list[str] | str,
+               attachments: list[tuple[str, bytes, str]] | None = None):
+    if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
+        print("⚠️ Falta EMAIL_USER/EMAIL_PASS/EMAIL_TO: no se envió correo.")
         return
     if isinstance(to_addr, str):
         recipients = [e.strip() for e in re.split(r"[;,]", to_addr) if e.strip()]
     else:
-        recipients = [e.strip() for e in (to_addr or []) if e and str(e).strip()]
+        recipients = [e.strip() for e in to_addr if e and str(e).strip()]
     recipients = list(dict.fromkeys(recipients))
     if not recipients:
-        print("⚠️ Sin destinatarios.")
+        print("⚠️ Lista de destinatarios vacía.")
         return
 
     msg = EmailMessage()
@@ -47,9 +49,10 @@ def send_email(subject: str, body: str, to_addr, attachments=None):
     msg.set_content(body)
 
     for (fname, data, mime) in (attachments or []):
-        maintype, subtype = (mime.split("/", 1) if mime else ("application","octet-stream"))
-        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fname)
+        mt, st = (mime.split("/", 1) if mime else ("application", "octet-stream"))
+        msg.add_attachment(data, maintype=mt, subtype=st, filename=fname)
 
+    import smtplib
     with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as smtp:
         if EMAIL_DEBUG:
             smtp.set_debuglevel(1)
@@ -58,13 +61,14 @@ def send_email(subject: str, body: str, to_addr, attachments=None):
         refused = smtp.send_message(msg, from_addr=EMAIL_USER, to_addrs=recipients)
     if refused:
         print(f"⚠️ Rechazados: {refused}")
-    print(f"📧 Enviado: {subject} → {', '.join(recipients)}")
+    print(f"📧 Email enviado a {', '.join(recipients)}: {subject}")
 
-# ─────────── Categorías (sin 'marcas') ───────────
+# ───────────────────── Categorías ─────────────────────
 CATEGORIES = {
     "ofertas": {"base_url": "https://www.elpalaciodehierro.com/ofertas/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 200, "prefix": "palacio_ofertas"},
     "electronica": {"base_url": "https://www.elpalaciodehierro.com/electronica/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 400, "prefix": "palacio_electronica"},
     "deportes": {"base_url": "https://www.elpalaciodehierro.com/deportes/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_deportes"},
+    # "marcas": {...}   # ← la omitimos porque tarda mucho (tú ya la quitaste)
     "gourmet": {"base_url": "https://www.elpalaciodehierro.com/gourmet/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_gourmet"},
     "casapalacio": {"base_url": "https://www.elpalaciodehierro.com/casapalacio/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_casapalacio"},
     "nuevos-productos": {"base_url": "https://www.elpalaciodehierro.com/nuevos-productos/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_nuevos_productos"},
@@ -84,7 +88,7 @@ CATEGORIES = {
     "más vendido": {"base_url": "https://www.elpalaciodehierro.com/lo-mas-vendido/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_vendido"},
 }
 
-# ─────────── Red / tiempos ───────────
+# ───────────────────── Red / tiempos ─────────────────────
 CONNECT_TIMEOUT = 20
 READ_TIMEOUT    = 180
 JITTER_MIN = 0.08
@@ -100,7 +104,6 @@ UA_LIST = [
     "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
-
 def random_headers():
     return {
         "user-agent": random.choice(UA_LIST),
@@ -109,6 +112,7 @@ def random_headers():
         "cache-control": "no-cache",
     }
 
+# ───────────────────── Red con reintentos ─────────────────────
 def build_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
@@ -125,7 +129,8 @@ def fetch_page(session: requests.Session, base_url: str, start: int, page_size: 
     params = {"start": start, "sz": page_size}
     time.sleep(random.uniform(0.05, 0.20))
     headers = random_headers()
-    resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    resp = session.get(base_url, params=params, headers=headers,
+                       timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
 
     if resp.status_code == 429 and "Retry-After" in resp.headers:
         try:
@@ -134,12 +139,14 @@ def fetch_page(session: requests.Session, base_url: str, start: int, page_size: 
             wait_s = 2.0
         print(f"⏳ 429 Retry-After {wait_s}s…")
         time.sleep(wait_s)
-        resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        resp = session.get(base_url, params=params, headers=headers,
+                           timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
 
     if resp.status_code in (520, 522, 523, 524):
         print(f"↻ CF {resp.status_code} start={start}, sz={page_size}. Reintentando…")
         time.sleep(random.uniform(1.0, 2.5))
-        resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        resp = session.get(base_url, params=params, headers=headers,
+                           timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
 
     resp.raise_for_status()
     return resp.text, resp.url
@@ -165,7 +172,7 @@ def _fetch_with_fallback(session, base_url, start, page_size):
                 raise
     raise last_err if last_err else RuntimeError("Fallo de red sin respuesta HTTP")
 
-# ─────────── Parse helpers ───────────
+# ───────────────────── Parse helpers ─────────────────────
 _money_clean = re.compile(r"[^\d.,]")
 
 def parse_price(txt):
@@ -216,6 +223,7 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
     soup = BeautifulSoup(html_text, "html.parser")
     tiles = soup.select("article.b-product_tile_item, div.b-product, li.product, div.product-tile")
     rows = []
+
     for t in tiles:
         bprod = nearest_b_product(t)
         info = extract_from_analytics(bprod)
@@ -289,16 +297,18 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
             "page_idx": page_idx,
             "captured_at": captured_at_iso,
         })
+
     return rows, len(tiles)
 
-# ─────────── Excel RAM ───────────
+# ───────────────────── Excel en memoria ─────────────────────
 HIGHLIGHT_BANDS = [
     (70, "#FFCDD2"),  # ≥70 rojo claro
     (60, "#FFE0B2"),  # ≥60 naranja
     (50, "#FFF59D"),  # ≥50 amarillo
     (30, "#DCEDC8"),  # ≥30 verde
 ]
-def build_xlsx_bytes(df: pd.DataFrame, out_prefix: str) -> bytes:
+
+def build_xlsx_bytes(df: pd.DataFrame) -> bytes:
     new_items = df.copy()
     removed_items = pd.DataFrame(columns=df.columns)
     key = "product_id"
@@ -307,12 +317,24 @@ def build_xlsx_bytes(df: pd.DataFrame, out_prefix: str) -> bytes:
         "list_price_old", "list_price_new", "sale_price_old", "sale_price_new",
         "discount_pct_old", "discount_pct_new", "enlace_new", "enlace_old"
     ])
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="SNAPSHOT")
-        pd.DataFrame({"info": ["Sin cambios de precio (RAM-only)"]}).to_excel(writer, index=False, sheet_name="CHANGES")
-        (new_items if not new_items.empty else pd.DataFrame({"info":["Sin nuevos productos"]})).to_excel(writer, index=False, sheet_name="NEW")
-        pd.DataFrame({"info": ["Sin productos removidos"]}).to_excel(writer, index=False, sheet_name="REMOVED")
+        if not changes.empty:
+            changes.to_excel(writer, index=False, sheet_name="CHANGES")
+        else:
+            pd.DataFrame({"info": ["Sin cambios de precio (RAM-only)"]}).to_excel(writer, index=False, sheet_name="CHANGES")
+
+        if not new_items.empty:
+            new_items.to_excel(writer, index=False, sheet_name="NEW")
+        else:
+            pd.DataFrame({"info": ["Sin nuevos productos"]}).to_excel(writer, index=False, sheet_name="NEW")
+
+        if not removed_items.empty:
+            removed_items.to_excel(writer, index=False, sheet_name="REMOVED")
+        else:
+            pd.DataFrame({"info": ["Sin productos removidos"]}).to_excel(writer, index=False, sheet_name="REMOVED")
 
         wb = writer.book
         money  = wb.add_format({"num_format": "#,##0.00"})
@@ -332,19 +354,21 @@ def build_xlsx_bytes(df: pd.DataFrame, out_prefix: str) -> bytes:
                 for r, val in enumerate(df_ref.get("enlace", pd.Series()).fillna(""), start=2):
                     if isinstance(val, str) and val.startswith("http"):
                         ws.write_url(r-1, ei, val, link, string=val)
-            ws.autofilter(0, 0, len(df_ref), len(cols)-1); ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, len(df_ref), len(cols)-1)
+            ws.freeze_panes(1, 0)
             if "discount_pct" in cols and not df_ref.empty:
                 last_row = len(df_ref) + 1
                 col_letter = chr(65 + cols.index("discount_pct"))
                 for thresh, hexcolor in HIGHLIGHT_BANDS:
-                    ws.conditional_format(1, 0, last_row, len(cols)-1, {
-                        "type": "formula", "criteria": f"=${col_letter}2>={thresh}",
-                        "format": wb.add_format({"bg_color": hexcolor}), "stop_if_true": True
-                    })
-
+                    fmt = wb.add_format({"bg_color": hexcolor})
+                    ws.conditional_format(
+                        1, 0, last_row, len(cols)-1,
+                        {"type": "formula", "criteria": f"=${col_letter}2>={thresh}", "format": fmt, "stop_if_true": True}
+                    )
         def fmt_simple(ws, df_ref):
             cols = list(df_ref.columns) if df_ref is not None and not df_ref.empty else ["info"]
-            ws.set_column(0, len(cols)-1, 18); ws.freeze_panes(1, 0)
+            ws.set_column(0, len(cols)-1, 18)
+            ws.freeze_panes(1, 0)
             ws.autofilter(0, 0, max(len(df_ref), 1) if df_ref is not None else 1, len(cols)-1)
 
         fmt_snapshot(writer.sheets["SNAPSHOT"], df)
@@ -355,7 +379,7 @@ def build_xlsx_bytes(df: pd.DataFrame, out_prefix: str) -> bytes:
     buf.seek(0)
     return buf.read()
 
-# ─────────── Runner ───────────
+# ───────────────────── Runner de categoría ─────────────────────
 COLUMNS_EXPORT = [
     "product_id","sku","name","brand","category","department","price_currency",
     "list_price","sale_price","discount_pct","availability","image_url","enlace",
@@ -364,6 +388,7 @@ COLUMNS_EXPORT = [
 
 def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     session = build_session()
+
     base_url  = args.url or cfg["base_url"]
     page_size = args.page_size or cfg["default_page_size"]
     page_step = args.page_step or cfg["default_page_step"]
@@ -386,13 +411,16 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
             try:
                 html_text, real_url, used_sz = _fetch_with_fallback(session, base_url, start, page_size)
             except Exception as e:
-                print(f"⚠️ Error red start={start}: {type(e).__name__}: {e}")
+                print(f"⚠️ Error de red start={start}: {type(e).__name__}: {e}")
                 empty_streak += 1
                 if empty_streak >= STOP_AFTER_EMPTY:
-                    print("Fin por errores consecutivos."); break
-                page_idx += 1; start += page_step; continue
+                    print("Fin por errores consecutivos.")
+                    break
+                page_idx += 1; start += page_step
+                continue
 
             page_rows, tiles_count = parse_products_from_html(html_text, real_url, page_start=start, page_idx=page_idx, captured_at_iso=captured_at)
+
             new_rows = []
             for r in page_rows:
                 key = r.get("product_id") or r.get("enlace")
@@ -404,11 +432,15 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
             if tiles_count == 0 or len(new_rows) == 0:
                 empty_streak += 1
                 if empty_streak >= STOP_AFTER_EMPTY:
-                    print("Fin: sin más resultados nuevos."); break
+                    print("Fin: sin más resultados nuevos.")
+                    break
             else:
-                empty_streak = 0; all_rows.extend(new_rows)
+                empty_streak = 0
+                all_rows.extend(new_rows)
 
-            page_idx += 1; start += page_step
+            page_idx += 1
+            start += page_step
+
             pause = random.uniform(JITTER_MIN, JITTER_MAX)
             if random.random() < 0.2: pause += random.uniform(0.6, 1.2)
             print(f"⏳ Pausa {pause:.2f}s…"); time.sleep(pause)
@@ -423,9 +455,11 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # (mantenemos image_url; si quisieras omitir alguna, puedes dropear aquí)
+        # Si alguna categoría debe omitir imagen, aquí la podrías manejar
+        # (dejamos imagen por defecto)
+
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        xlsx_bytes = build_xlsx_bytes(df, out_prefix)
+        xlsx_bytes = build_xlsx_bytes(df)
         xlsx_name  = f"{out_prefix}_snapshot_{stamp}.xlsx"
 
         total_rows = len(df)
@@ -436,25 +470,32 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
                 f"Filas: {total_rows}\n"
                 f"≥{args.highlight or HIGHLIGHT_DISCOUNT}% desc.: {big_disc}\n"
                 f"Adjunto: {xlsx_name}\n"
-                f"Modo: RAM-only (no se escribió en disco)")
-        send_email(subj, body, EMAIL_TO_LIST, attachments=[(xlsx_name, xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")])
+                f"Modo: RAM-only (y guardado local si SAVE_DIR)")
+        send_email(subj, body, EMAIL_TO, attachments=[(xlsx_name, xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")])
+
+        # Guardar en disco si SAVE_DIR está definido (para rclone)
+        if SAVE_DIR:
+            Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
+            with open(Path(SAVE_DIR) / xlsx_name, "wb") as f:
+                f.write(xlsx_bytes)
+            print(f"💾 Guardado local: {Path(SAVE_DIR) / xlsx_name}")
 
         return {"category": cat_key, "ok": True, "rows": total_rows, "big_disc": big_disc}
 
     except Exception as e:
-        send_email(f"[Scraper] {out_prefix} CRASH (RAM-only)", f"Error en {cat_key}: {type(e).__name__}: {e}", EMAIL_TO_LIST, attachments=[])
+        send_email(f"[Scraper] {out_prefix} CRASH (RAM-only)", f"Error en {cat_key}: {type(e).__name__}: {e}", EMAIL_TO, attachments=[])
         return {"category": cat_key, "ok": False, "error": f"{type(e).__name__}: {e}"}
 
-# ─────────── CLI ───────────
+# ───────────────────── CLI / helpers ─────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description="Scraper Palacio (RAM-only, envía XLSX por correo).")
-    p.add_argument("--all", action="store_true", help="Todas las categorías (correo por categoría + resumen).")
+    p = argparse.ArgumentParser(description="Scraper Palacio (RAM-only, email + guardado local opcional).")
+    p.add_argument("--all", action="store_true", help="Ejecuta TODAS las categorías.")
     p.add_argument("--category", "-c", choices=CATEGORIES.keys(), help="Categoría individual.")
     p.add_argument("--url", help="URL base personalizada (solo una categoría).")
-    p.add_argument("--start", type=int, default=None, help="Offset 'start=' (default 0).")
-    p.add_argument("--page-size", type=int, default=None, help="Ítems por página 'sz='.")
-    p.add_argument("--page-step", type=int, default=None, help="Incremento 'start'.")
-    p.add_argument("--max-pages", type=int, default=None, help="Máximo de páginas.")
+    p.add_argument("--start", type=int, default=None, help="Offset inicial 'start=' (default 0).")
+    p.add_argument("--page-size", type=int, default=None, help="Ítems por página 'sz=' (default por categoría).")
+    p.add_argument("--page-step", type=int, default=None, help="Incremento 'start' (default por categoría).")
+    p.add_argument("--max-pages", type=int, default=None, help="Máximo de páginas (default por categoría).")
     p.add_argument("--highlight", type=float, default=HIGHLIGHT_DISCOUNT, help="Umbral % para conteo de alto descuento.")
     args, unknown = p.parse_known_args()
     if unknown:
@@ -472,7 +513,8 @@ def pick_category_interactively():
             return keys[idx-1]
     except Exception:
         pass
-    print("Opción inválida, usando 'deportes'."); return "deportes"
+    print("Opción inválida, usando 'deportes'.")
+    return "deportes"
 
 def main():
     args = parse_args()
@@ -480,7 +522,8 @@ def main():
         print("▶ Ejecutando TODAS las categorías…")
         results = []
         for idx, (cat_key, cfg) in enumerate(CATEGORIES.items(), start=1):
-            res = run_single_category(cat_key, cfg, args); results.append(res)
+            res = run_single_category(cat_key, cfg, args)
+            results.append(res)
             if idx < len(CATEGORIES):
                 cat_pause = random.uniform(0.6, 1.5)
                 if random.random() < 0.2: cat_pause += random.uniform(0.8, 1.6)
@@ -493,27 +536,23 @@ def main():
             body_lines.append(f"  ✓ {r['category']}: filas={r['rows']}, ≥{args.highlight}%={r['big_disc']}")
         for r in bad:
             body_lines.append(f"  ✗ {r['category']}: {r['error']}")
-        send_email("[Scraper] Resumen ALL (RAM-only)", "\n".join(body_lines), EMAIL_TO_LIST, attachments=[])
-        print("🎉 Terminaron todas.")
+        send_email("[Scraper] Resumen ALL (RAM-only)", "\n".join(body_lines), EMAIL_TO, attachments=[])
+        print("🎉 Terminaron todas las categorías.")
     else:
         cat_key = args.category or pick_category_interactively()
         run_single_category(cat_key, CATEGORIES[cat_key], args)
 
-# Helpers para correr rápido desde notebooks (opcionales)
+# Helpers para Jupyter/Actions (si quisieras)
 def run_one_quick(CAT="ofertas", MAX_PAGES=None, PAGE_SIZE=None, PAGE_STEP=None, HIGHLIGHT=None):
-    ns = argparse.Namespace(
-        url=None, page_size=PAGE_SIZE, page_step=PAGE_STEP, max_pages=MAX_PAGES,
-        start=None, highlight=(HIGHLIGHT if HIGHLIGHT is not None else HIGHLIGHT_DISCOUNT),
-        all=False, category=CAT
-    )
+    ns = argparse.Namespace(url=None, page_size=PAGE_SIZE, page_step=PAGE_STEP, max_pages=MAX_PAGES,
+                            start=None, highlight=(HIGHLIGHT if HIGHLIGHT is not None else HIGHLIGHT_DISCOUNT),
+                            all=False, category=CAT)
     return run_single_category(CAT, CATEGORIES[CAT], ns)
 
 def run_all_quick(MAX_PAGES=None, PAGE_SIZE=None, PAGE_STEP=None, HIGHLIGHT=None):
-    ns = argparse.Namespace(
-        url=None, page_size=PAGE_SIZE, page_step=PAGE_STEP, max_pages=MAX_PAGES,
-        start=None, highlight=(HIGHLIGHT if HIGHLIGHT is not None else HIGHLIGHT_DISCOUNT),
-        all=True, category=None
-    )
+    ns = argparse.Namespace(url=None, page_size=PAGE_SIZE, page_step=PAGE_STEP, max_pages=MAX_PAGES,
+                            start=None, highlight=(HIGHLIGHT if HIGHLIGHT is not None else HIGHLIGHT_DISCOUNT),
+                            all=True, category=None)
     print("▶ Ejecutando TODAS (helper)…")
     results = []
     for idx, (cat_key, cfg) in enumerate(CATEGORIES.items(), start=1):
@@ -522,12 +561,6 @@ def run_all_quick(MAX_PAGES=None, PAGE_SIZE=None, PAGE_STEP=None, HIGHLIGHT=None
             cat_pause = random.uniform(0.6, 1.5)
             if random.random() < 0.2: cat_pause += random.uniform(0.8, 1.6)
             print(f"⏸️ Pausa entre categorías: {cat_pause:.2f}s…"); time.sleep(cat_pause)
-    ok=[r for r in results if r.get("ok")]; bad=[r for r in results if not r.get("ok")]
-    body_lines=["Resumen (helper RAM-only):", f"OK: {len(ok)}  |  Fallidas: {len(bad)}"]
-    for r in ok:  body_lines.append(f"  ✓ {r['category']}: filas={r['rows']}, ≥{ns.highlight}%={r['big_disc']}")
-    for r in bad: body_lines.append(f"  ✗ {r['category']}: {r['error']}")
-    send_email("[Scraper] Resumen ALL (helper RAM-only)", "\n".join(body_lines), EMAIL_TO_LIST, attachments=[])
-    return results
 
 if __name__ == "__main__":
     main()
