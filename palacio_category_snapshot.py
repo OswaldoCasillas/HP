@@ -1,12 +1,9 @@
 # palacio_category_snapshot.py
-# Scraper Palacio → guarda CSV + PARQUET + XLSX por categoría y mes.
-# - SNAPHOT + CHANGES + NEW + REMOVED (comparando contra el último .parquet previo).
-# - Soporta ejecutar una categoría o todas (con --all).
-# - Robusto ante CF 52x/429 y con pausas ligeras.
-# - "marcas" omite image_url (para reducir I/O).
-# - OUT_BASE_DIR = out_palacio/
+# Snapshot a disco + diffs contra snapshot previo en la misma carpeta.
+# Hojas: SNAPSHOT / CHANGES / NEW / REMOVED
+# Lee OUT_BASE_DIR de env (por defecto "out_palacio").
 
-import re, io, os, glob, math, json, time, random, argparse
+import os, re, io, time, json, random, html, argparse
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urljoin
@@ -17,15 +14,38 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ───────── Salidas ─────────
-OUT_BASE_DIR = Path("out_palacio")
+# ================= Config básica =================
+OUT_BASE_DIR = Path(os.getenv("OUT_BASE_DIR", "out_palacio"))
 OUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ───────── Categorías ─────────
+CONNECT_TIMEOUT = 20
+READ_TIMEOUT    = 180
+JITTER_MIN = 0.06
+JITTER_MAX = 0.22
+LONG_PAUSE_EVERY = (12, 18)
+LONG_PAUSE_RANGE = (1.2, 3.2)
+STOP_AFTER_EMPTY = 1
+HIGHLIGHT_DISCOUNT = 51
+
+UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
+]
+
+def random_headers():
+    return {
+        "user-agent": random.choice(UA_LIST),
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": random.choice(["es-MX,es;q=0.9,en;q=0.8","es-ES,es;q=0.9,en;q=0.6","en-US,en;q=0.9"]),
+        "cache-control": "no-cache",
+    }
+
 CATEGORIES = {
     "ofertas": {"base_url": "https://www.elpalaciodehierro.com/ofertas/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 200, "prefix": "palacio_ofertas"},
     "electronica": {"base_url": "https://www.elpalaciodehierro.com/electronica/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 400, "prefix": "palacio_electronica"},
     "deportes": {"base_url": "https://www.elpalaciodehierro.com/deportes/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_deportes"},
+    # "marcas": { ... }  # ← la quitaste porque tarda mucho
     "gourmet": {"base_url": "https://www.elpalaciodehierro.com/gourmet/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_gourmet"},
     "casapalacio": {"base_url": "https://www.elpalaciodehierro.com/casapalacio/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_casapalacio"},
     "nuevos-productos": {"base_url": "https://www.elpalaciodehierro.com/nuevos-productos/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_nuevos_productos"},
@@ -45,34 +65,11 @@ CATEGORIES = {
     "mas-vendido": {"base_url": "https://www.elpalaciodehierro.com/lo-mas-vendido/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_vendido"},
 }
 
-# ───────── Red / Tiempos ─────────
-CONNECT_TIMEOUT = 20
-READ_TIMEOUT    = 180
-JITTER_MIN = 0.08
-JITTER_MAX = 0.25
-LONG_PAUSE_EVERY = (12, 18)
-LONG_PAUSE_RANGE = (1.5, 4.0)
-STOP_AFTER_EMPTY = 1
-HIGHLIGHT_DISCOUNT = 51
-
-UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-]
-def random_headers():
-    return {
-        "user-agent": random.choice(UA_LIST),
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": random.choice(["es-MX,es;q=0.9,en;q=0.8","es-ES,es;q=0.9,en;q=0.6","en-US,en;q=0.9"]),
-        "cache-control": "no-cache",
-    }
-
+# ================= Red con reintentos =================
 def build_session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
-        total=6, connect=3, read=3, backoff_factor=1.2,
+        total=6, connect=3, read=3, backoff_factor=1.1,
         status_forcelist=[429, 500, 502, 503, 504, 520, 522, 523, 524],
         allowed_methods=["GET"], raise_on_status=False,
     )
@@ -83,20 +80,22 @@ def build_session() -> requests.Session:
 
 def fetch_page(session: requests.Session, base_url: str, start: int, page_size: int):
     params = {"start": start, "sz": page_size}
-    time.sleep(random.uniform(0.05, 0.20))
+    time.sleep(random.uniform(0.04, 0.14))
     headers = random_headers()
     resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
 
     if resp.status_code == 429 and "Retry-After" in resp.headers:
-        try: wait_s = float(resp.headers["Retry-After"])
-        except Exception: wait_s = 2.0
+        try:
+            wait_s = float(resp.headers["Retry-After"])
+        except Exception:
+            wait_s = 2.0
         print(f"⏳ 429 Retry-After {wait_s}s…")
         time.sleep(wait_s)
         resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
 
     if resp.status_code in (520, 522, 523, 524):
         print(f"↻ CF {resp.status_code} start={start}, sz={page_size}. Reintentando…")
-        time.sleep(random.uniform(1.0, 2.5))
+        time.sleep(random.uniform(1.0, 2.3))
         resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
 
     resp.raise_for_status()
@@ -117,28 +116,32 @@ def _fetch_with_fallback(session, base_url, start, page_size):
         except requests.HTTPError as e:
             last_err = e
             if e.response is not None and e.response.status_code in (520, 522, 523, 524):
-                time.sleep(random.uniform(1.0, 2.0))
-                continue
+                time.sleep(random.uniform(1.0, 2.0)); continue
             else:
                 raise
     raise last_err if last_err else RuntimeError("Fallo de red sin respuesta HTTP")
 
-# ───────── Parseo ─────────
+# ================= Parse helpers =================
 _money_clean = re.compile(r"[^\d.,]")
+
 def parse_price(txt):
     if not txt: return None
     s = _money_clean.sub("", txt).strip().replace(",", "")
-    try: return float(s)
-    except ValueError: return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
-def text_or_none(el): return el.get_text(" ", strip=True) if el else None
+def text_or_none(el):
+    return el.get_text(" ", strip=True) if el else None
 
 def nearest_b_product(node):
     cur = node
     for _ in range(8):
         if cur is None: break
         classes = cur.get("class") or []
-        if "b-product" in classes: return cur
+        if "b-product" in classes:
+            return cur
         cur = cur.parent
     return node
 
@@ -148,7 +151,7 @@ def extract_from_analytics(bprod):
     da = bprod.get("data-analytics")
     if da:
         try:
-            data = json.loads(da)
+            data = json.loads(html.unescape(da))
             prod = data.get("product", {}) if isinstance(data, dict) else {}
             out["product_id_analytics"] = str(prod.get("id")) if prod.get("id") is not None else None
             out["name_analytics"]       = prod.get("name")
@@ -161,13 +164,15 @@ def extract_from_analytics(bprod):
         except Exception:
             pass
     for k in ["data-pid","data-cnstrc-item-id","data-cnstrc-item-name"]:
-        if bprod.get(k): out[k] = bprod.get(k)
+        if bprod.get(k):
+            out[k] = bprod.get(k)
     return out
 
 def parse_products_from_html(html_text, page_url, page_start, page_idx, captured_at_iso):
     soup = BeautifulSoup(html_text, "html.parser")
     tiles = soup.select("article.b-product_tile_item, div.b-product, li.product, div.product-tile")
     rows = []
+
     for t in tiles:
         bprod = nearest_b_product(t)
         info = extract_from_analytics(bprod)
@@ -211,7 +216,6 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
         list_span = t.select_one("div.b-product_price-old span.b-product_price-value")
         sale_span = t.select_one("div.b-product_price-sales.m-reduced span.b-product_price-value") \
                   or t.select_one("div.b-product_price-sales span.b-product_price-value")
-
         def _num(el):
             if not el: return None
             txt = el.get("content") or el.text
@@ -242,102 +246,78 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
             "page_idx": page_idx,
             "captured_at": captured_at_iso,
         })
+
     return rows, len(tiles)
 
-# ───────── Diffs / Persistencia ─────────
-def latest_previous_parquet(out_prefix: str, search_root_dir: Path, exclude_stamp: str | None = None):
-    search_root_dir.mkdir(parents=True, exist_ok=True)
-    pattern = str(search_root_dir / f"**/{out_prefix}_snapshot_*.parquet")
-    files = sorted(glob.glob(pattern, recursive=True))
-    if not files: return None
-    if exclude_stamp: files = [f for f in files if exclude_stamp not in f]
-    return Path(files[-1]) if files else None
+# ================= Excel & diffs =================
+def find_prev_parquet(folder: Path, prefix: str):
+    if not folder.exists(): return None
+    cands = sorted(folder.glob(f"{prefix}_snapshot_*.parquet"))
+    return cands[-1] if cands else None
 
-def save_snapshot(df: pd.DataFrame, stamp: str, out_prefix: str, out_dir: Path, search_root_dir: Path | None = None, highlight=HIGHLIGHT_DISCOUNT):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path  = out_dir / f"{out_prefix}_snapshot_{stamp}.csv"
-    pq_path   = out_dir / f"{out_prefix}_snapshot_{stamp}.parquet"
-    xlsx_path = out_dir / f"{out_prefix}_snapshot_{stamp}.xlsx"
+def compute_diffs(df_new: pd.DataFrame, df_old: pd.DataFrame):
+    key_cols = ["product_id", "enlace"]
+    def best_key(df):
+        if "product_id" in df.columns and df["product_id"].notna().any():
+            return "product_id"
+        return "enlace"
 
-    prev_pq = latest_previous_parquet(out_prefix, search_root_dir) if search_root_dir is not None else None
+    key = best_key(df_new)
+    # NEW
+    old_keys = set(df_old[key].dropna().astype(str)) if df_old is not None and key in df_old.columns else set()
+    new_keys = set(df_new[key].dropna().astype(str)) if key in df_new.columns else set()
+    only_new_keys = new_keys - old_keys
+    only_old_keys = old_keys - new_keys
 
-    for col in ["list_price", "sale_price", "discount_pct"]:
-        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
+    new_df = df_new[df_new[key].astype(str).isin(only_new_keys)].copy() if only_new_keys else pd.DataFrame(columns=df_new.columns)
+    removed_df = df_old[df_old[key].astype(str).isin(only_old_keys)].copy() if df_old is not None and only_old_keys else pd.DataFrame(columns=df_new.columns)
 
-    changes = pd.DataFrame()
-    new_items = pd.DataFrame()
-    removed_items = pd.DataFrame()
-    key = "product_id"
-
-    if prev_pq is not None and Path(prev_pq).exists():
-        prev_df = pd.read_parquet(prev_pq)
-        for d in (df, prev_df):
-            if "product_id" in d.columns: d["product_id"] = d["product_id"].astype("string")
-            if "sku" in d.columns: d["sku"] = d["sku"].astype("string")
-            for col in ("list_price", "sale_price", "discount_pct"):
-                if col in d.columns: d[col] = pd.to_numeric(d[col], errors="coerce")
-        use_pid = (df["product_id"].notna().sum() > 0) and (prev_df["product_id"].notna().sum() > 0)
-        key = "product_id" if use_pid else "sku"
-
-        merged = prev_df.merge(df, on=key, suffixes=("_old", "_new"), how="outer", indicator=True)
-
-        def changed_num(a, b, atol=0.01):
-            if pd.isna(a) or pd.isna(b): return False
-            try: return not math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=atol)
-            except Exception: return a != b
-
-        both = merged[merged["_merge"] == "both"].copy()
-        change_mask = (
-            both.apply(lambda r: changed_num(r.get("list_price_old"), r.get("list_price_new")), axis=1)
-            | both.apply(lambda r: changed_num(r.get("sale_price_old"), r.get("sale_price_new")), axis=1)
-            | both.apply(lambda r: changed_num(r.get("discount_pct_old"), r.get("discount_pct_new")), axis=1)
-            | (both["sale_price_old"].isna() ^ both["sale_price_new"].isna())
-        )
-        changes = both.loc[change_mask].copy()
-
-        new_items     = merged[merged["_merge"] == "right_only"].copy()
-        removed_items = merged[merged["_merge"] == "left_only"].copy()
-
-        if not new_items.empty:
-            keep_cols = [c for c in new_items.columns if c.endswith("_new") or c == key]
-            new_items = new_items[keep_cols].rename(columns=lambda c: c.replace("_new", ""))
-        if not removed_items.empty:
-            keep_cols = [c for c in removed_items.columns if c.endswith("_old") or c == key]
-            removed_items = removed_items[keep_cols].rename(columns=lambda c: c.replace("_old", ""))
+    # CHANGES (precio / descuento)
+    changes_cols = ["list_price", "sale_price", "discount_pct", "name", "brand"]
+    if df_old is None:
+        changes_df = pd.DataFrame(columns=[key] + [f"{c}_old" for c in changes_cols] + [f"{c}_new" for c in changes_cols] + ["enlace_old","enlace_new"])
     else:
-        new_items = df.copy()
-        removed_items = pd.DataFrame(columns=df.columns)
-        changes = pd.DataFrame(columns=[key, "name_old", "name_new", "brand_old", "brand_new",
-                                        "list_price_old", "list_price_new", "sale_price_old", "sale_price_new",
-                                        "discount_pct_old", "discount_pct_new", "enlace_new", "enlace_old"])
+        left = df_old.set_index(key)
+        right = df_new.set_index(key)
+        common = left.index.intersection(right.index)
+        rows = []
+        for k in common:
+            row_old = left.loc[k]
+            row_new = right.loc[k]
+            changed = False
+            rec = {key: k}
+            for col in changes_cols:
+                oldv = row_old.get(col, None)
+                newv = row_new.get(col, None)
+                rec[f"{col}_old"] = oldv
+                rec[f"{col}_new"] = newv
+                if pd.isna(oldv) and pd.isna(newv):
+                    pass
+                elif (oldv != newv):
+                    changed = True
+            rec["enlace_old"] = row_old.get("enlace", None)
+            rec["enlace_new"] = row_new.get("enlace", None)
+            if changed:
+                rows.append(rec)
+        changes_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[key] + [f"{c}_old" for c in changes_cols] + [f"{c}_new" for c in changes_cols] + ["enlace_old","enlace_new"])
 
-    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+    return new_df, removed_df, changes_df
+
+def write_excel_with_formats(df, new_df, removed_df, changes_df, out_xlsx: Path, highlight=HIGHLIGHT_DISCOUNT):
+    import xlsxwriter
+    out_xlsx.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_xlsx, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="SNAPSHOT")
-        cols_order = [key,"name_old","name_new","brand_old","brand_new","list_price_old","list_price_new",
-                      "sale_price_old","sale_price_new","discount_pct_old","discount_pct_new","enlace_new","enlace_old"]
-        if not changes.empty:
-            for c in cols_order:
-                if c not in changes.columns: changes[c] = None
-            changes[cols_order].to_excel(writer, index=False, sheet_name="CHANGES")
-        else:
-            pd.DataFrame({"info": ["Sin cambios de precio"]}).to_excel(writer, index=False, sheet_name="CHANGES")
-
-        if not new_items.empty:
-            new_items.to_excel(writer, index=False, sheet_name="NEW")
-        else:
-            pd.DataFrame({"info": ["Sin nuevos productos"]}).to_excel(writer, index=False, sheet_name="NEW")
-
-        if not removed_items.empty:
-            removed_items.to_excel(writer, index=False, sheet_name="REMOVED")
-        else:
-            pd.DataFrame({"info": ["Sin productos removidos"]}).to_excel(writer, index=False, sheet_name="REMOVED")
+        (changes_df if not changes_df.empty else pd.DataFrame({"info":["Sin cambios"]})).to_excel(writer, index=False, sheet_name="CHANGES")
+        (new_df if not new_df.empty else pd.DataFrame({"info":["Sin nuevos productos"]})).to_excel(writer, index=False, sheet_name="NEW")
+        (removed_df if not removed_df.empty else pd.DataFrame({"info":["Sin productos removidos"]})).to_excel(writer, index=False, sheet_name="REMOVED")
 
         wb = writer.book
         money  = wb.add_format({"num_format": "#,##0.00"})
         pctfmt = wb.add_format({'num_format': '0.00"%"'})
         link   = wb.add_format({"font_color": "blue", "underline": 1})
 
-        def format_snapshot(ws, df_ref: pd.DataFrame):
+        def fmt_snapshot(ws, df_ref):
             cols = list(df_ref.columns)
             ws.set_column(0, len(cols)-1, 18)
             for nm in ("list_price", "sale_price"):
@@ -345,63 +325,69 @@ def save_snapshot(df: pd.DataFrame, stamp: str, out_prefix: str, out_dir: Path, 
                     i = cols.index(nm); ws.set_column(i, i, 14, money)
             if "discount_pct" in cols:
                 di = cols.index("discount_pct"); ws.set_column(di, di, 12, pctfmt)
+                # bandas
+                last_row = len(df_ref) + 1
+                col_letter = chr(65 + di)
+                for thresh, color in [(70, "#FFCDD2"), (60, "#FFE0B2"), (50, "#FFF59D"), (30, "#DCEDC8")]:
+                    ws.conditional_format(
+                        1, 0, last_row, len(cols)-1,
+                        {"type": "formula", "criteria": f"=${col_letter}2>={thresh}",
+                         "format": wb.add_format({"bg_color": color}), "stop_if_true": False}
+                    )
+            # hipervínculos
             if "enlace" in cols:
                 ei = cols.index("enlace")
                 for r, val in enumerate(df_ref.get("enlace", pd.Series()).fillna(""), start=2):
                     if isinstance(val, str) and val.startswith("http"):
                         ws.write_url(r-1, ei, val, link, string=val)
-            ws.autofilter(0, 0, len(df_ref), len(cols)-1)
-            ws.freeze_panes(1, 0)
-            if "discount_pct" in cols:
-                last_row = len(df_ref) + 1
-                col_letter = chr(65 + cols.index("discount_pct"))
-                for thresh, color in [(70,"#FFCDD2"), (60,"#FFE0B2"), (50,"#FFF59D"), (30,"#DCEDC8")]:
-                    ws.conditional_format(1, 0, last_row, len(cols)-1, {
-                        "type": "formula", "criteria": f"=${col_letter}2>={thresh}", "format": wb.add_format({"bg_color": color}), "stop_if_true": True
-                    })
-
-        def format_table(ws, df_ref: pd.DataFrame):
-            cols = list(df_ref.columns) if df_ref is not None and not df_ref.empty else ["info"]
-            ws.set_column(0, len(cols)-1, 18)
-            for nm in ["list_price_old","list_price_new","sale_price_old","sale_price_new"]:
-                if nm in cols: ws.set_column(cols.index(nm), cols.index(nm), 14, money)
-            for nm in ["discount_pct_old","discount_pct_new"]:
-                if nm in cols: ws.set_column(cols.index(nm), cols.index(nm), 12, pctfmt)
-            ws.autofilter(0, 0, max(len(df_ref), 1), len(cols)-1)
+            ws.autofilter(0, 0, max(1, len(df_ref)), max(0, len(cols)-1))
             ws.freeze_panes(1, 0)
 
-        format_snapshot(writer.sheets["SNAPSHOT"], df)
-        format_table(writer.sheets["CHANGES"], changes if not changes.empty else pd.DataFrame(columns=cols_order))
-        format_table(writer.sheets["NEW"], new_items)
-        format_table(writer.sheets["REMOVED"], removed_items)
+        fmt_snapshot(writer.sheets["SNAPSHOT"], df)
+
+def save_snapshot(cat_key: str, prefix: str, df: pd.DataFrame, highlight: float):
+    # cast num
+    for col in ["list_price", "sale_price", "discount_pct"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    month_dir = OUT_BASE_DIR / prefix / datetime.now().strftime("%Y-%m")
+    month_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = f"{prefix}_snapshot_{stamp}"
+    csv_path = month_dir / f"{base_name}.csv"
+    pq_path  = month_dir / f"{base_name}.parquet"
+    xlsx_path= month_dir / f"{base_name}.xlsx"
+
+    # buscar previo
+    prev_pq = find_prev_parquet(month_dir, prefix)
+    df_prev = pd.read_parquet(prev_pq) if prev_pq and prev_pq.exists() else None
+
+    new_df, removed_df, changes_df = compute_diffs(df, df_prev if df_prev is not None else pd.DataFrame(columns=df.columns))
 
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    df.to_parquet(pq_path, index=False)
+    df.to_parquet(pq_path, index=False)  # requiere pyarrow/fastparquet
 
-    if prev_pq is not None:
-        print(f"📝 Cambios: {len(changes)} | Nuevos: {len(new_items)} | Removidos: {len(removed_items)}")
-    else:
-        print(f"ℹ️ Primer snapshot (no hay comparación previa).")
-    print(f"✅ Snapshot guardado:\n- CSV : {csv_path}\n- PQ  : {pq_path}\n- XLSX: {xlsx_path}")
-    return csv_path, pq_path, xlsx_path
+    write_excel_with_formats(df, new_df, removed_df, changes_df, xlsx_path, highlight=highlight)
 
-# ───────── CLI / Runner ─────────
-def parse_args():
-    p = argparse.ArgumentParser(description="Scraper Palacio (disco + diffs)")
-    p.add_argument("--all", action="store_true", help="Todas las categorías en orden.")
-    p.add_argument("--category", "-c", choices=CATEGORIES.keys(), help="Categoría única.")
-    p.add_argument("--url", help="URL base personalizada (solo una categoría).")
-    p.add_argument("--start", type=int, default=None, help="start (default 0).")
-    p.add_argument("--page-size", type=int, default=None, help="sz (default por categoría).")
-    p.add_argument("--page-step", type=int, default=None, help="step (default por categoría).")
-    p.add_argument("--max-pages", type=int, default=None, help="máximo de páginas (default por categoría).")
-    p.add_argument("--highlight", type=float, default=HIGHLIGHT_DISCOUNT, help="Umbral % para resaltar.")
-    args, unknown = p.parse_known_args()
-    if unknown: print("⚠️ Ignorando args no reconocidos:", unknown)
-    return args
+    if prev_pq is None:
+        print(f"ℹ️ Primer snapshot de la categoría. Archivo: {xlsx_path}")
+    print("✅ Snapshot guardado:")
+    print(f"- CSV : {csv_path}")
+    print(f"- PQ  : {pq_path}")
+    print(f"- XLSX: {xlsx_path}")
 
-def run_single_category(cat_key, cfg, args):
+# ================= Runner =================
+COLUMNS_EXPORT = [
+    "product_id","sku","name","brand","category","department","price_currency",
+    "list_price","sale_price","discount_pct","availability","image_url","enlace",
+    "page_start","page_idx","captured_at"
+]
+
+def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     session = build_session()
+
     base_url  = args.url or cfg["base_url"]
     page_size = args.page_size or cfg["default_page_size"]
     page_step = args.page_step or cfg["default_page_step"]
@@ -409,15 +395,11 @@ def run_single_category(cat_key, cfg, args):
     start     = args.start if args.start is not None else 0
     out_prefix = cfg["prefix"]
 
-    category_root_dir = OUT_BASE_DIR / out_prefix
-    month_slug = datetime.now().strftime("%Y-%m")
-    out_dir = category_root_dir / month_slug
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"\n=== {cat_key} ===")
     print(f"URL base: {base_url}")
     print(f"start={start}, sz={page_size}, step={page_step}, max_pages={max_pages}, highlight={args.highlight}%")
-    print(f"Guardando en: {out_dir.resolve()}")
+    month_dir = OUT_BASE_DIR / out_prefix / datetime.now().strftime("%Y-%m")
+    print(f"Guardando en: {month_dir}")
 
     all_rows, seen_ids = [], set()
     page_idx = 0
@@ -443,7 +425,7 @@ def run_single_category(cat_key, cfg, args):
         for r in page_rows:
             key = r.get("product_id") or r.get("enlace")
             if key and key not in seen_ids:
-                seen_ids.add(key); new_rows.append(r)
+                seen_ids.add(str(key)); new_rows.append(r)
 
         print(f"Página {page_idx} (start={start}, sz={used_sz}): tiles={tiles_count}, nuevos={len(new_rows)}")
 
@@ -454,46 +436,57 @@ def run_single_category(cat_key, cfg, args):
                 break
         else:
             empty_streak = 0
-            if (cat_key == "marcas") and "image_url" in new_rows[0]:
-                # por si marcas se ejecuta: omite image_url
-                for rr in new_rows:
-                    rr.pop("image_url", None)
             all_rows.extend(new_rows)
 
         page_idx += 1
         start += page_step
 
         pause = random.uniform(JITTER_MIN, JITTER_MAX)
-        if random.random() < 0.2: pause += random.uniform(0.6, 1.2)
+        if random.random() < 0.2: pause += random.uniform(0.5, 1.0)
         print(f"⏳ Pausa {pause:.2f}s…"); time.sleep(pause)
+
         if page_idx == next_long_pause_at:
             long_pause = random.uniform(*LONG_PAUSE_RANGE)
             print(f"⏳⏳ Pausa larga {long_pause:.2f}s…"); time.sleep(long_pause)
             next_long_pause_at += random.randint(*LONG_PAUSE_EVERY)
 
-    df = pd.DataFrame(all_rows, columns=["product_id","sku","name","brand","category","department","price_currency","list_price","sale_price","discount_pct","availability","image_url","enlace","page_start","page_idx","captured_at"])
-    for col in ["list_price","sale_price","discount_pct"]:
-        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
-    if (cat_key == "marcas") and "image_url" in df.columns:
-        df.drop(columns=["image_url"], inplace=True)
+    df = pd.DataFrame(all_rows, columns=COLUMNS_EXPORT)
+    save_snapshot(cat_key, out_prefix, df, args.highlight)
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_snapshot(df, stamp, out_prefix, out_dir, search_root_dir=category_root_dir, highlight=args.highlight)
+    return {"category": cat_key, "rows": len(df)}
+
+# ================= CLI =================
+def parse_args():
+    p = argparse.ArgumentParser(description="Scraper Palacio → snapshot a disco y diffs.")
+    p.add_argument("--all", action="store_true", help="Ejecuta todas las categorías.")
+    p.add_argument("--category", "-c", choices=CATEGORIES.keys(), help="Categoría individual.")
+    p.add_argument("--url", help="URL base personalizada.")
+    p.add_argument("--start", type=int, default=None, help="Offset inicial start= (default 0).")
+    p.add_argument("--page-size", type=int, default=None, help="Items por página sz=.")
+    p.add_argument("--page-step", type=int, default=None, help="Incremento de start.")
+    p.add_argument("--max-pages", type=int, default=None, help="Máximo de páginas.")
+    p.add_argument("--highlight", type=float, default=HIGHLIGHT_DISCOUNT, help="Umbral % para resaltar.")
+    args, unknown = p.parse_known_args()
+    if unknown:
+        print("⚠️ Ignorando args no reconocidos:", unknown)
+    return args
 
 def main():
     args = parse_args()
     if args.all:
+        print("▶ Ejecutando TODAS las categorías…")
         for idx, (cat_key, cfg) in enumerate(CATEGORIES.items(), start=1):
             run_single_category(cat_key, cfg, args)
             if idx < len(CATEGORIES):
-                cat_pause = random.uniform(0.6, 1.5)
-                if random.random() < 0.2: cat_pause += random.uniform(0.8, 1.6)
-                print(f"⏸️ Pausa entre categorías: {cat_pause:.2f}s…"); time.sleep(cat_pause)
+                gap = random.uniform(0.4, 1.2)
+                time.sleep(gap)
         print("🎉 Terminaron todas las categorías.")
     else:
-        if not args.category:
-            print("⚠️ Debes indicar --all o -c <categoria>"); return
-        run_single_category(args.category, CATEGORIES[args.category], args)
+        cat_key = args.category
+        if not cat_key:
+            print("❌ Falta -c/--category si no usas --all")
+            return
+        run_single_category(cat_key, CATEGORIES[cat_key], args)
 
 if __name__ == "__main__":
     main()
