@@ -3,7 +3,7 @@ name: Palacio Scraper (DISCO → Drive + Email CHANGES + rclone)
 on:
   schedule:
     # 08:00 y 20:00 UTC ≈ 02:00 y 14:00 CDMX
-    - cron: "0 8,20 * * *"
+    #- cron: "0 8,20 * * *"
   workflow_dispatch:
     inputs:
       run_all:
