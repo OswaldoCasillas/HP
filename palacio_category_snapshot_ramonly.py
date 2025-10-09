@@ -1,11 +1,11 @@
 # palacio_category_snapshot_ramonly.py
-# Scraper Palacio → genera XLSX en memoria, lo ENVÍA por correo y (opcional) lo guarda en disco (SAVE_DIR).
-# - Corre 1 categoría o TODAS (--all).
-# - Reintentos CF (520–524) y 429 Retry-After.
-# - Resaltado multicolor en Excel por bandas de descuento.
-# - Múltiples destinatarios: EMAIL_TO acepta coma o punto y coma.
+# Scraper Palacio → ahora: histórico real con NEW/CHANGES/REMOVED contra el snapshot previo por categoría.
+# - Guarda XLSX + PARQUET en SAVE_DIR (env), adjunta XLSX por correo.
+# - Si hay PARQUET previo en SAVE_DIR que matchea el prefijo, calcula diferencias.
+# - "marcas": sigue omitiendo image_url si la columna existe.
+# - Tolerancia para cambios numéricos: 1 centavo.
 
-import os, re, io, math, json, time, random, argparse, smtplib, html
+import os, re, io, math, json, time, random, argparse, smtplib, html, glob
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urljoin
@@ -17,58 +17,46 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ───────────────────── Email (desde secrets/entorno) ─────────────────────
+# ───────────────── Config email ─────────────────
 EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_USER = os.getenv("EMAIL_USER", "")
 EMAIL_PASS = os.getenv("EMAIL_PASS", "")
 EMAIL_TO   = os.getenv("EMAIL_TO", "")
-EMAIL_DEBUG = os.getenv("EMAIL_DEBUG", "0") not in ("", "0", "false", "False", "FALSE")
+EMAIL_DEBUG = os.getenv("EMAIL_DEBUG", "0") not in ("", "0", "false", "False")
+EMAIL_TO_LIST = [e.strip() for e in re.split(r"[;,]", EMAIL_TO) if e.strip()]
 
-# Carpeta opcional para guardar XLSX (el workflow la define como /tmp/palacio_out)
-SAVE_DIR = os.getenv("SAVE_DIR", "").strip()  # si vacío → no guarda en disco
-
-def send_email(subject: str, body: str, to_addr: list[str] | str,
-               attachments: list[tuple[str, bytes, str]] | None = None):
-    if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO:
-        print("⚠️ Falta EMAIL_USER/EMAIL_PASS/EMAIL_TO: no se envió correo.")
+def send_email(subject: str, body: str, to_addr, attachments=None):
+    if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO_LIST:
+        print("⚠️ EMAIL_* incompletos: no se envía correo.")
         return
-    if isinstance(to_addr, str):
-        recipients = [e.strip() for e in re.split(r"[;,]", to_addr) if e.strip()]
-    else:
-        recipients = [e.strip() for e in to_addr if e and str(e).strip()]
+    recipients = EMAIL_TO_LIST if not isinstance(to_addr, str) else [e.strip() for e in re.split(r"[;,]", to_addr) if e.strip()]
     recipients = list(dict.fromkeys(recipients))
-    if not recipients:
-        print("⚠️ Lista de destinatarios vacía.")
-        return
-
     msg = EmailMessage()
     msg["From"] = EMAIL_USER
     msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
     msg.set_content(body)
-
     for (fname, data, mime) in (attachments or []):
-        mt, st = (mime.split("/", 1) if mime else ("application", "octet-stream"))
+        mt, st = (mime.split("/",1) if mime else ("application","octet-stream"))
         msg.add_attachment(data, maintype=mt, subtype=st, filename=fname)
-
     import smtplib
     with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as smtp:
-        if EMAIL_DEBUG:
-            smtp.set_debuglevel(1)
-        smtp.ehlo(); smtp.starttls(); smtp.ehlo()
-        smtp.login(EMAIL_USER, EMAIL_PASS)
+        if EMAIL_DEBUG: smtp.set_debuglevel(1)
+        smtp.ehlo(); smtp.starttls(); smtp.ehlo(); smtp.login(EMAIL_USER, EMAIL_PASS)
         refused = smtp.send_message(msg, from_addr=EMAIL_USER, to_addrs=recipients)
-    if refused:
-        print(f"⚠️ Rechazados: {refused}")
+    if refused: print("⚠️ Rechazados:", refused)
     print(f"📧 Email enviado a {', '.join(recipients)}: {subject}")
 
-# ───────────────────── Categorías ─────────────────────
+# ──────────────── Config salida ────────────────
+SAVE_DIR = Path(os.getenv("SAVE_DIR", "/tmp/palacio_out"))
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ──────────────── Categorías ────────────────
 CATEGORIES = {
     "ofertas": {"base_url": "https://www.elpalaciodehierro.com/ofertas/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 200, "prefix": "palacio_ofertas"},
     "electronica": {"base_url": "https://www.elpalaciodehierro.com/electronica/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 400, "prefix": "palacio_electronica"},
     "deportes": {"base_url": "https://www.elpalaciodehierro.com/deportes/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_deportes"},
-    # "marcas": {...}   # ← la omitimos porque tarda mucho (tú ya la quitaste)
     "gourmet": {"base_url": "https://www.elpalaciodehierro.com/gourmet/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_gourmet"},
     "casapalacio": {"base_url": "https://www.elpalaciodehierro.com/casapalacio/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_casapalacio"},
     "nuevos-productos": {"base_url": "https://www.elpalaciodehierro.com/nuevos-productos/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_nuevos_productos"},
@@ -88,11 +76,10 @@ CATEGORIES = {
     "más vendido": {"base_url": "https://www.elpalaciodehierro.com/lo-mas-vendido/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_vendido"},
 }
 
-# ───────────────────── Red / tiempos ─────────────────────
+# ──────────────── Red/tiempos ────────────────
 CONNECT_TIMEOUT = 20
 READ_TIMEOUT    = 180
-JITTER_MIN = 0.08
-JITTER_MAX = 0.25
+JITTER_MIN, JITTER_MAX = 0.08, 0.25
 LONG_PAUSE_EVERY = (12, 18)
 LONG_PAUSE_RANGE = (1.5, 4.0)
 STOP_AFTER_EMPTY = 1
@@ -112,52 +99,38 @@ def random_headers():
         "cache-control": "no-cache",
     }
 
-# ───────────────────── Red con reintentos ─────────────────────
 def build_session() -> requests.Session:
     s = requests.Session()
-    retry = Retry(
-        total=6, connect=3, read=3, backoff_factor=1.2,
-        status_forcelist=[429, 500, 502, 503, 504, 520, 522, 523, 524],
-        allowed_methods=["GET"], raise_on_status=False,
-    )
+    retry = Retry(total=6, connect=3, read=3, backoff_factor=1.2,
+                  status_forcelist=[429,500,502,503,504,520,522,523,524],
+                  allowed_methods=["GET"], raise_on_status=False)
     adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
+    s.mount("http://", adapter); s.mount("https://", adapter)
     return s
 
 def fetch_page(session: requests.Session, base_url: str, start: int, page_size: int):
     params = {"start": start, "sz": page_size}
     time.sleep(random.uniform(0.05, 0.20))
     headers = random_headers()
-    resp = session.get(base_url, params=params, headers=headers,
-                       timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-
+    resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
     if resp.status_code == 429 and "Retry-After" in resp.headers:
-        try:
-            wait_s = float(resp.headers["Retry-After"])
-        except Exception:
-            wait_s = 2.0
-        print(f"⏳ 429 Retry-After {wait_s}s…")
-        time.sleep(wait_s)
-        resp = session.get(base_url, params=params, headers=headers,
-                           timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-
-    if resp.status_code in (520, 522, 523, 524):
+        try: wait_s = float(resp.headers["Retry-After"])
+        except Exception: wait_s = 2.0
+        print(f"⏳ 429 Retry-After {wait_s}s…"); time.sleep(wait_s)
+        resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    if resp.status_code in (520,522,523,524):
         print(f"↻ CF {resp.status_code} start={start}, sz={page_size}. Reintentando…")
         time.sleep(random.uniform(1.0, 2.5))
-        resp = session.get(base_url, params=params, headers=headers,
-                           timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-
+        resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
     resp.raise_for_status()
     return resp.text, resp.url
 
 def _fetch_with_fallback(session, base_url, start, page_size):
     try_sizes = [page_size] if page_size else []
-    for sz in (200, 120, 80):
-        if sz not in try_sizes:
-            try_sizes.append(sz)
+    for sz in (200,120,80):
+        if sz not in try_sizes: try_sizes.append(sz)
     last_err = None
-    for sz_try in try_sizes or [200, 120, 80]:
+    for sz_try in try_sizes or [200,120,80]:
         try:
             html_text, real_url = fetch_page(session, base_url, start, sz_try)
             if page_size and sz_try != page_size:
@@ -165,34 +138,27 @@ def _fetch_with_fallback(session, base_url, start, page_size):
             return html_text, real_url, sz_try
         except requests.HTTPError as e:
             last_err = e
-            if e.response is not None and e.response.status_code in (520, 522, 523, 524):
-                time.sleep(random.uniform(1.0, 2.0))
-                continue
-            else:
-                raise
+            if e.response is not None and e.response.status_code in (520,522,523,524):
+                time.sleep(random.uniform(1.0, 2.0)); continue
+            else: raise
     raise last_err if last_err else RuntimeError("Fallo de red sin respuesta HTTP")
 
-# ───────────────────── Parse helpers ─────────────────────
+# ──────────────── Parse helpers ────────────────
 _money_clean = re.compile(r"[^\d.,]")
-
 def parse_price(txt):
     if not txt: return None
     s = _money_clean.sub("", txt).strip().replace(",", "")
-    try:
-        return float(s)
-    except ValueError:
-        return None
+    try: return float(s)
+    except ValueError: return None
 
-def text_or_none(el):
-    return el.get_text(" ", strip=True) if el else None
+def text_or_none(el): return el.get_text(" ", strip=True) if el else None
 
 def nearest_b_product(node):
     cur = node
     for _ in range(8):
         if cur is None: break
         classes = cur.get("class") or []
-        if "b-product" in classes:
-            return cur
+        if "b-product" in classes: return cur
         cur = cur.parent
     return node
 
@@ -212,18 +178,15 @@ def extract_from_analytics(bprod):
             out["price_analytics"]      = prod.get("price")
             out["currency_analytics"]   = prod.get("priceCurrency") or "MXN"
             out["availability_analytics"]= prod.get("availability")
-        except Exception:
-            pass
+        except Exception: pass
     for k in ["data-pid","data-cnstrc-item-id","data-cnstrc-item-name"]:
-        if bprod.get(k):
-            out[k] = bprod.get(k)
+        if bprod.get(k): out[k] = bprod.get(k)
     return out
 
 def parse_products_from_html(html_text, page_url, page_start, page_idx, captured_at_iso):
     soup = BeautifulSoup(html_text, "html.parser")
     tiles = soup.select("article.b-product_tile_item, div.b-product, li.product, div.product-tile")
     rows = []
-
     for t in tiles:
         bprod = nearest_b_product(t)
         info = extract_from_analytics(bprod)
@@ -270,8 +233,7 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
         def _num(el):
             if not el: return None
             txt = el.get("content") or el.text
-            if not txt: return None
-            return parse_price(txt)
+            return parse_price(txt) if txt else None
         list_price = _num(list_span)
         sale_price = _num(sale_span)
 
@@ -297,44 +259,67 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
             "page_idx": page_idx,
             "captured_at": captured_at_iso,
         })
-
     return rows, len(tiles)
 
-# ───────────────────── Excel en memoria ─────────────────────
-HIGHLIGHT_BANDS = [
-    (70, "#FFCDD2"),  # ≥70 rojo claro
-    (60, "#FFE0B2"),  # ≥60 naranja
-    (50, "#FFF59D"),  # ≥50 amarillo
-    (30, "#DCEDC8"),  # ≥30 verde
-]
+# ──────────────── Diferencias + Excel ────────────────
+HIGHLIGHT_BANDS = [(70,"#FFCDD2"), (60,"#FFE0B2"), (50,"#FFF59D"), (30,"#DCEDC8")]
 
-def build_xlsx_bytes(df: pd.DataFrame) -> bytes:
-    new_items = df.copy()
-    removed_items = pd.DataFrame(columns=df.columns)
+def _latest_previous_parquet(out_prefix: str, folder: Path) -> Path | None:
+    files = sorted(glob.glob(str(folder / f"{out_prefix}_snapshot_*.parquet")))
+    return Path(files[-1]) if files else None
+
+def _normalize_numeric(df: pd.DataFrame, cols=("list_price","sale_price","discount_pct")):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+def _changes_merge(prev_df: pd.DataFrame, cur_df: pd.DataFrame):
+    # decidir clave
+    use_pid = (cur_df["product_id"].notna().sum() > 0) and (prev_df["product_id"].notna().sum() > 0)
+    key = "product_id" if use_pid else "sku"
+
+    merged = prev_df.merge(cur_df, on=key, suffixes=("_old","_new"), how="outer", indicator=True)
+
+    def changed_num(a,b,atol=0.01):
+        if pd.isna(a) or pd.isna(b): return False
+        try: return not math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=atol)
+        except Exception: return a != b
+
+    both = merged[merged["_merge"]=="both"].copy()
+    mask = (
+        both.apply(lambda r: changed_num(r.get("list_price_old"), r.get("list_price_new")), axis=1) |
+        both.apply(lambda r: changed_num(r.get("sale_price_old"), r.get("sale_price_new")), axis=1) |
+        both.apply(lambda r: changed_num(r.get("discount_pct_old"), r.get("discount_pct_new")), axis=1) |
+        (both["sale_price_old"].isna() ^ both["sale_price_new"].isna())
+    )
+    changes = both.loc[mask].copy()
+    new_items = merged[merged["_merge"]=="right_only"].copy()
+    removed_items = merged[merged["_merge"]=="left_only"].copy()
+
+    if not new_items.empty:
+        keep_cols = [c for c in new_items.columns if c.endswith("_new") or c == key]
+        new_items = new_items[keep_cols].rename(columns=lambda c: c.replace("_new",""))
+    if not removed_items.empty:
+        keep_cols = [c for c in removed_items.columns if c.endswith("_old") or c == key]
+        removed_items = removed_items[keep_cols].rename(columns=lambda c: c.replace("_old",""))
+
+    return key, changes, new_items, removed_items
+
+def build_xlsx_bytes(df: pd.DataFrame, prev_df: pd.DataFrame|None, out_prefix: str) -> bytes:
     key = "product_id"
-    changes = pd.DataFrame(columns=[
-        key, "name_old", "name_new", "brand_old", "brand_new",
-        "list_price_old", "list_price_new", "sale_price_old", "sale_price_new",
-        "discount_pct_old", "discount_pct_new", "enlace_new", "enlace_old"
-    ])
+    if prev_df is not None and not prev_df.empty and not df.empty:
+        key, changes, new_items, removed_items = _changes_merge(prev_df, df)
+    else:
+        changes = pd.DataFrame({ "info": ["Sin cambios de precio (primer snapshot o vacío)"] })
+        new_items = df.copy()
+        removed_items = pd.DataFrame(columns=df.columns)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="SNAPSHOT")
-        if not changes.empty:
-            changes.to_excel(writer, index=False, sheet_name="CHANGES")
-        else:
-            pd.DataFrame({"info": ["Sin cambios de precio (RAM-only)"]}).to_excel(writer, index=False, sheet_name="CHANGES")
-
-        if not new_items.empty:
-            new_items.to_excel(writer, index=False, sheet_name="NEW")
-        else:
-            pd.DataFrame({"info": ["Sin nuevos productos"]}).to_excel(writer, index=False, sheet_name="NEW")
-
-        if not removed_items.empty:
-            removed_items.to_excel(writer, index=False, sheet_name="REMOVED")
-        else:
-            pd.DataFrame({"info": ["Sin productos removidos"]}).to_excel(writer, index=False, sheet_name="REMOVED")
+        (changes if "info" not in changes.columns else changes).to_excel(writer, index=False, sheet_name="CHANGES")
+        (new_items if not new_items.empty else pd.DataFrame({"info":["Sin nuevos productos"]})).to_excel(writer, index=False, sheet_name="NEW")
+        (removed_items if not removed_items.empty else pd.DataFrame({"info":["Sin productos removidos"]})).to_excel(writer, index=False, sheet_name="REMOVED")
 
         wb = writer.book
         money  = wb.add_format({"num_format": "#,##0.00"})
@@ -344,7 +329,7 @@ def build_xlsx_bytes(df: pd.DataFrame) -> bytes:
         def fmt_snapshot(ws, df_ref):
             cols = list(df_ref.columns)
             ws.set_column(0, len(cols)-1, 18)
-            for nm in ("list_price", "sale_price"):
+            for nm in ("list_price","sale_price"):
                 if nm in cols:
                     i = cols.index(nm); ws.set_column(i, i, 14, money)
             if "discount_pct" in cols:
@@ -361,15 +346,13 @@ def build_xlsx_bytes(df: pd.DataFrame) -> bytes:
                 col_letter = chr(65 + cols.index("discount_pct"))
                 for thresh, hexcolor in HIGHLIGHT_BANDS:
                     fmt = wb.add_format({"bg_color": hexcolor})
-                    ws.conditional_format(
-                        1, 0, last_row, len(cols)-1,
-                        {"type": "formula", "criteria": f"=${col_letter}2>={thresh}", "format": fmt, "stop_if_true": True}
-                    )
+                    ws.conditional_format(1, 0, last_row, len(cols)-1,
+                        {"type":"formula","criteria":f"=${col_letter}2>={thresh}","format":fmt,"stop_if_true":True})
+
         def fmt_simple(ws, df_ref):
             cols = list(df_ref.columns) if df_ref is not None and not df_ref.empty else ["info"]
-            ws.set_column(0, len(cols)-1, 18)
-            ws.freeze_panes(1, 0)
-            ws.autofilter(0, 0, max(len(df_ref), 1) if df_ref is not None else 1, len(cols)-1)
+            ws.set_column(0, len(cols)-1, 18); ws.freeze_panes(1,0)
+            ws.autofilter(0,0, max(len(df_ref),1) if df_ref is not None else 1, len(cols)-1)
 
         fmt_snapshot(writer.sheets["SNAPSHOT"], df)
         fmt_simple(writer.sheets["CHANGES"], changes)
@@ -379,16 +362,13 @@ def build_xlsx_bytes(df: pd.DataFrame) -> bytes:
     buf.seek(0)
     return buf.read()
 
-# ───────────────────── Runner de categoría ─────────────────────
-COLUMNS_EXPORT = [
-    "product_id","sku","name","brand","category","department","price_currency",
-    "list_price","sale_price","discount_pct","availability","image_url","enlace",
-    "page_start","page_idx","captured_at"
-]
+# ──────────────── Runner ────────────────
+COLUMNS_EXPORT = ["product_id","sku","name","brand","category","department","price_currency",
+                  "list_price","sale_price","discount_pct","availability","image_url","enlace",
+                  "page_start","page_idx","captured_at"]
 
 def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     session = build_session()
-
     base_url  = args.url or cfg["base_url"]
     page_size = args.page_size or cfg["default_page_size"]
     page_step = args.page_step or cfg["default_page_step"]
@@ -406,157 +386,133 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     next_long_pause_at = random.randint(*LONG_PAUSE_EVERY)
     captured_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
-    try:
-        while page_idx < max_pages:
-            try:
-                html_text, real_url, used_sz = _fetch_with_fallback(session, base_url, start, page_size)
-            except Exception as e:
-                print(f"⚠️ Error de red start={start}: {type(e).__name__}: {e}")
-                empty_streak += 1
-                if empty_streak >= STOP_AFTER_EMPTY:
-                    print("Fin por errores consecutivos.")
-                    break
-                page_idx += 1; start += page_step
-                continue
+    while page_idx < max_pages:
+        try:
+            html_text, real_url, used_sz = _fetch_with_fallback(session, base_url, start, page_size)
+        except Exception as e:
+            print(f"⚠️ Error de red start={start}: {type(e).__name__}: {e}")
+            empty_streak += 1
+            if empty_streak >= STOP_AFTER_EMPTY:
+                print("Fin por errores consecutivos."); break
+            page_idx += 1; start += page_step; continue
 
-            page_rows, tiles_count = parse_products_from_html(html_text, real_url, page_start=start, page_idx=page_idx, captured_at_iso=captured_at)
+        page_rows, tiles_count = parse_products_from_html(html_text, real_url, page_start=start, page_idx=page_idx, captured_at_iso=captured_at)
 
-            new_rows = []
-            for r in page_rows:
-                key = r.get("product_id") or r.get("enlace")
-                if key and key not in seen_ids:
-                    seen_ids.add(key); new_rows.append(r)
+        new_rows = []
+        for r in page_rows:
+            key = r.get("product_id") or r.get("enlace")
+            if key and key not in seen_ids:
+                seen_ids.add(key); new_rows.append(r)
 
-            print(f"Página {page_idx} (start={start}, sz={used_sz}): tiles={tiles_count}, nuevos={len(new_rows)}")
+        print(f"Página {page_idx} (start={start}, sz={used_sz}): tiles={tiles_count}, nuevos={len(new_rows)}")
 
-            if tiles_count == 0 or len(new_rows) == 0:
-                empty_streak += 1
-                if empty_streak >= STOP_AFTER_EMPTY:
-                    print("Fin: sin más resultados nuevos.")
-                    break
-            else:
-                empty_streak = 0
-                all_rows.extend(new_rows)
+        if tiles_count == 0 or len(new_rows) == 0:
+            empty_streak += 1
+            if empty_streak >= STOP_AFTER_EMPTY:
+                print("Fin: sin más resultados nuevos."); break
+        else:
+            empty_streak = 0; all_rows.extend(new_rows)
 
-            page_idx += 1
-            start += page_step
+        page_idx += 1; start += page_step
 
-            pause = random.uniform(JITTER_MIN, JITTER_MAX)
-            if random.random() < 0.2: pause += random.uniform(0.6, 1.2)
-            print(f"⏳ Pausa {pause:.2f}s…"); time.sleep(pause)
+        pause = random.uniform(JITTER_MIN, JITTER_MAX)
+        if random.random() < 0.2: pause += random.uniform(0.6, 1.2)
+        print(f"⏳ Pausa {pause:.2f}s…"); time.sleep(pause)
 
-            if page_idx == next_long_pause_at:
-                long_pause = random.uniform(*LONG_PAUSE_RANGE)
-                print(f"⏳⏳ Pausa larga {long_pause:.2f}s…"); time.sleep(long_pause)
-                next_long_pause_at += random.randint(*LONG_PAUSE_EVERY)
+        if page_idx == next_long_pause_at:
+            long_pause = random.uniform(*LONG_PAUSE_RANGE)
+            print(f"⏳⏳ Pausa larga {long_pause:.2f}s…"); time.sleep(long_pause)
+            next_long_pause_at += random.randint(*LONG_PAUSE_EVERY)
 
-        df = pd.DataFrame(all_rows, columns=COLUMNS_EXPORT)
-        for col in ["list_price","sale_price","discount_pct"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = pd.DataFrame(all_rows, columns=COLUMNS_EXPORT)
+    _normalize_numeric(df)
 
-        # Si alguna categoría debe omitir imagen, aquí la podrías manejar
-        # (dejamos imagen por defecto)
+    if (cfg.get("omit_image_url") or cat_key == "marcas") and "image_url" in df.columns:
+        df.drop(columns=["image_url"], inplace=True)
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        xlsx_bytes = build_xlsx_bytes(df)
-        xlsx_name  = f"{out_prefix}_snapshot_{stamp}.xlsx"
+    # histórico previo (si rclone ya bajó .parquet al SAVE_DIR)
+    prev_pq = _latest_previous_parquet(out_prefix, SAVE_DIR)
+    prev_df = None
+    if prev_pq and prev_pq.exists():
+        try:
+            prev_df = pd.read_parquet(prev_pq)
+            _normalize_numeric(prev_df)
+            # normaliza claves
+            for d in (df, prev_df):
+                if "product_id" in d.columns: d["product_id"] = d["product_id"].astype("string")
+                if "sku" in d.columns: d["sku"] = d["sku"].astype("string")
+        except Exception as e:
+            print(f"⚠️ No pude leer previo {prev_pq.name}: {e}")
 
-        total_rows = len(df)
-        big_disc = int((df.get("discount_pct", pd.Series(dtype=float)).fillna(0) >= (args.highlight or HIGHLIGHT_DISCOUNT)).sum())
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    xlsx_bytes = build_xlsx_bytes(df, prev_df, out_prefix)
+    xlsx_name  = f"{out_prefix}_snapshot_{stamp}.xlsx"
+    pq_name    = f"{out_prefix}_snapshot_{stamp}.parquet"
 
-        subj = f"[Scraper] {out_prefix} listo (RAM-only {stamp})"
-        body = (f"Categoría: {cat_key}\n"
-                f"Filas: {total_rows}\n"
-                f"≥{args.highlight or HIGHLIGHT_DISCOUNT}% desc.: {big_disc}\n"
-                f"Adjunto: {xlsx_name}\n"
-                f"Modo: RAM-only (y guardado local si SAVE_DIR)")
-        send_email(subj, body, EMAIL_TO, attachments=[(xlsx_name, xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")])
+    # Guarda en disco para el workflow (y para histórico en Drive)
+    (SAVE_DIR / xlsx_name).write_bytes(xlsx_bytes)
+    df.to_parquet(SAVE_DIR / pq_name, index=False)
 
-        # Guardar en disco si SAVE_DIR está definido (para rclone)
-        if SAVE_DIR:
-            Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
-            with open(Path(SAVE_DIR) / xlsx_name, "wb") as f:
-                f.write(xlsx_bytes)
-            print(f"💾 Guardado local: {Path(SAVE_DIR) / xlsx_name}")
+    # correo
+    total_rows = len(df)
+    big_disc = int((df.get("discount_pct", pd.Series(dtype=float)).fillna(0) >= (args.highlight or HIGHLIGHT_DISCOUNT)).sum())
+    subj = f"[Scraper] {out_prefix} listo (RAM-only {stamp})"
+    body = (f"Categoría: {cat_key}\nFilas: {total_rows}\n≥{args.highlight or HIGHLIGHT_DISCOUNT}% desc.: {big_disc}\n"
+            f"Adjunto: {xlsx_name}\nHistórico: {'sí' if prev_df is not None else 'no (primer snapshot)'}\n"
+            f"Guardado: {SAVE_DIR}")
+    send_email(subj, body, EMAIL_TO_LIST, attachments=[(xlsx_name, xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")])
 
-        return {"category": cat_key, "ok": True, "rows": total_rows, "big_disc": big_disc}
+    return {"category": cat_key, "ok": True, "rows": total_rows, "big_disc": big_disc}
 
-    except Exception as e:
-        send_email(f"[Scraper] {out_prefix} CRASH (RAM-only)", f"Error en {cat_key}: {type(e).__name__}: {e}", EMAIL_TO, attachments=[])
-        return {"category": cat_key, "ok": False, "error": f"{type(e).__name__}: {e}"}
-
-# ───────────────────── CLI / helpers ─────────────────────
+# ──────────────── CLI ────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description="Scraper Palacio (RAM-only, email + guardado local opcional).")
-    p.add_argument("--all", action="store_true", help="Ejecuta TODAS las categorías.")
-    p.add_argument("--category", "-c", choices=CATEGORIES.keys(), help="Categoría individual.")
-    p.add_argument("--url", help="URL base personalizada (solo una categoría).")
-    p.add_argument("--start", type=int, default=None, help="Offset inicial 'start=' (default 0).")
-    p.add_argument("--page-size", type=int, default=None, help="Ítems por página 'sz=' (default por categoría).")
-    p.add_argument("--page-step", type=int, default=None, help="Incremento 'start' (default por categoría).")
-    p.add_argument("--max-pages", type=int, default=None, help="Máximo de páginas (default por categoría).")
-    p.add_argument("--highlight", type=float, default=HIGHLIGHT_DISCOUNT, help="Umbral % para conteo de alto descuento.")
+    p = argparse.ArgumentParser(description="Scraper Palacio (RAM-only + histórico, envía XLSX por correo).")
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--category", "-c", choices=CATEGORIES.keys())
+    p.add_argument("--url"); p.add_argument("--start", type=int, default=None)
+    p.add_argument("--page-size", type=int, default=None); p.add_argument("--page-step", type=int, default=None)
+    p.add_argument("--max-pages", type=int, default=None)
+    p.add_argument("--highlight", type=float, default=HIGHLIGHT_DISCOUNT)
     args, unknown = p.parse_known_args()
-    if unknown:
-        print("⚠️ Ignorando argumentos no reconocidos:", unknown)
+    if unknown: print("⚠️ Ignorando args:", unknown)
     return args
 
 def pick_category_interactively():
-    print("Elige una categoría:")
-    keys = list(CATEGORIES.keys())
-    for i, k in enumerate(keys, start=1):
-        print(f"  {i}) {k}  →  {CATEGORIES[k]['base_url']}")
+    print("Elige una categoría:"); keys = list(CATEGORIES.keys())
+    for i,k in enumerate(keys, start=1): print(f"  {i}) {k}  →  {CATEGORIES[k]['base_url']}")
     try:
-        idx = int(input("Número (1..{}): ".format(len(keys))).strip())
-        if 1 <= idx <= len(keys):
-            return keys[idx-1]
-    except Exception:
-        pass
-    print("Opción inválida, usando 'deportes'.")
-    return "deportes"
+        idx = int(input(f"Número (1..{len(keys)}): ").strip())
+        if 1 <= idx <= len(keys): return keys[idx-1]
+    except Exception: pass
+    print("Opción inválida, usando 'deportes'."); return "deportes"
 
 def main():
     args = parse_args()
     if args.all:
         print("▶ Ejecutando TODAS las categorías…")
-        results = []
-        for idx, (cat_key, cfg) in enumerate(CATEGORIES.items(), start=1):
-            res = run_single_category(cat_key, cfg, args)
-            results.append(res)
+        for idx,(cat_key,cfg) in enumerate(CATEGORIES.items(), start=1):
+            run_single_category(cat_key, cfg, args)
             if idx < len(CATEGORIES):
                 cat_pause = random.uniform(0.6, 1.5)
                 if random.random() < 0.2: cat_pause += random.uniform(0.8, 1.6)
                 print(f"⏸️ Pausa entre categorías: {cat_pause:.2f}s…"); time.sleep(cat_pause)
-
-        ok  = [r for r in results if r.get("ok")]
-        bad = [r for r in results if not r.get("ok")]
-        body_lines = ["Resumen de corrida (RAM-only):", f"OK: {len(ok)}  |  Fallidas: {len(bad)}"]
-        for r in ok:
-            body_lines.append(f"  ✓ {r['category']}: filas={r['rows']}, ≥{args.highlight}%={r['big_disc']}")
-        for r in bad:
-            body_lines.append(f"  ✗ {r['category']}: {r['error']}")
-        send_email("[Scraper] Resumen ALL (RAM-only)", "\n".join(body_lines), EMAIL_TO, attachments=[])
-        print("🎉 Terminaron todas las categorías.")
+        print("🎉 Terminaron todas.")
     else:
         cat_key = args.category or pick_category_interactively()
         run_single_category(cat_key, CATEGORIES[cat_key], args)
 
-# Helpers para Jupyter/Actions (si quisieras)
+# Helpers Jupyter
 def run_one_quick(CAT="ofertas", MAX_PAGES=None, PAGE_SIZE=None, PAGE_STEP=None, HIGHLIGHT=None):
-    ns = argparse.Namespace(url=None, page_size=PAGE_SIZE, page_step=PAGE_STEP, max_pages=MAX_PAGES,
-                            start=None, highlight=(HIGHLIGHT if HIGHLIGHT is not None else HIGHLIGHT_DISCOUNT),
-                            all=False, category=CAT)
+    ns = argparse.Namespace(url=None, page_size=PAGE_SIZE, page_step=PAGE_STEP, max_pages=MAX_PAGES, start=None,
+                            highlight=(HIGHLIGHT if HIGHLIGHT is not None else HIGHLIGHT_DISCOUNT), all=False, category=CAT)
     return run_single_category(CAT, CATEGORIES[CAT], ns)
 
 def run_all_quick(MAX_PAGES=None, PAGE_SIZE=None, PAGE_STEP=None, HIGHLIGHT=None):
-    ns = argparse.Namespace(url=None, page_size=PAGE_SIZE, page_step=PAGE_STEP, max_pages=MAX_PAGES,
-                            start=None, highlight=(HIGHLIGHT if HIGHLIGHT is not None else HIGHLIGHT_DISCOUNT),
-                            all=True, category=None)
+    ns = argparse.Namespace(url=None, page_size=PAGE_SIZE, page_step=PAGE_STEP, max_pages=MAX_PAGES, start=None,
+                            highlight=(HIGHLIGHT if HIGHLIGHT is not None else HIGHLIGHT_DISCOUNT), all=True, category=None)
     print("▶ Ejecutando TODAS (helper)…")
-    results = []
-    for idx, (cat_key, cfg) in enumerate(CATEGORIES.items(), start=1):
-        res = run_single_category(cat_key, cfg, ns); results.append(res)
+    for idx,(cat_key,cfg) in enumerate(CATEGORIES.items(), start=1):
+        run_single_category(cat_key, cfg, ns)
         if idx < len(CATEGORIES):
             cat_pause = random.uniform(0.6, 1.5)
             if random.random() < 0.2: cat_pause += random.uniform(0.8, 1.6)
