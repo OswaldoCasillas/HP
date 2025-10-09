@@ -2,7 +2,7 @@ name: Palacio Scraper (RAM-only email)
 
 on:
   schedule:
-    # 2:00 y 14:00 hora de CDMX (UTC−6) = 08:00 y 20:00 UTC
+    # 2:00 y 14:00 hora de CDMX (UTC−6) ≈ 08:00 y 20:00 UTC
     - cron: '0 8,20 * * *'
   workflow_dispatch:
     inputs:
@@ -38,12 +38,11 @@ on:
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
-    # GitHub Actions tiene tope de 360 min (6h)
     timeout-minutes: 360
 
     steps:
       - name: Checkout repo
-      - uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -57,14 +56,12 @@ jobs:
 
       - name: Run scraper
         env:
-          # Pasamos los secretos (si no existen, el script usa defaults seguros)
           EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
           EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO:   ${{ secrets.EMAIL_TO }}
 
-          # Inputs del dispatch (cuando se corre manualmente desde Actions)
           RUN_ALL:   ${{ github.event.inputs.run_all }}
           CATEGORY:  ${{ github.event.inputs.category }}
           START:     ${{ github.event.inputs.start }}
@@ -75,7 +72,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Defaults cuando no viene por workflow_dispatch:
           RUN_ALL="${RUN_ALL:-true}"
           CATEGORY="${CATEGORY:-}"
           START="${START:-0}"
@@ -94,7 +90,6 @@ jobs:
             ARGS+=(-c "${CATEGORY}")
           fi
 
-          # Parámetros opcionales
           [[ -n "${START}"     ]] && ARGS+=(--start "${START}")
           [[ -n "${PAGE_SIZE}" ]] && ARGS+=(--page-size "${PAGE_SIZE}")
           [[ -n "${PAGE_STEP}" ]] && ARGS+=(--page-step "${PAGE_STEP}")
@@ -103,4 +98,3 @@ jobs:
 
           echo "python palacio_category_snapshot_ramonly.py ${ARGS[*]}"
           python palacio_category_snapshot_ramonly.py "${ARGS[@]}"
-
