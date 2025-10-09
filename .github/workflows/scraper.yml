@@ -2,8 +2,8 @@ name: Palacio Scraper (RAM + Email + Drive)
 
 on:
   schedule:
-    # 3:00 AM America/Mexico_City (UTC-6 ≈ 09:00Z, UTC-5 ≈ 08:00Z)
-    - cron: "0 9 * * *"   # Invierno
+    # 3:00 AM America/Mexico_City (CDMX sin DST → 09:00Z todo el año)
+    - cron: "0 9 * * *"
   workflow_dispatch:
     inputs:
       run_all:
@@ -62,35 +62,12 @@ jobs:
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter
+          pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
 
       - name: Crear carpeta de salida
         run: mkdir -p "$SAVE_DIR"
 
-      - name: Ejecutar scraper
-        shell: bash
-        run: |
-          set -euo pipefail
-          args=()
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            if [[ "${{ inputs.run_all }}" == "true" ]]; then
-              args+=(--all)
-            else
-              [[ -n "${{ inputs.category }}" ]] || { echo "run_all=false pero sin 'category'"; exit 1; }
-              args+=(-c "${{ inputs.category }}")
-            fi
-            [[ -n "${{ inputs.start }}"     ]] && args+=(--start "${{ inputs.start }}")
-            [[ -n "${{ inputs.page_size }}" ]] && args+=(--page-size "${{ inputs.page_size }}")
-            [[ -n "${{ inputs.page_step }}" ]] && args+=(--page-step "${{ inputs.page_step }}")
-            [[ -n "${{ inputs.max_pages }}" ]] && args+=(--max-pages "${{ inputs.max_pages }}")
-            [[ -n "${{ inputs.highlight }}" ]] && args+=(--highlight "${{ inputs.highlight }}")
-          else
-            args+=(--all)
-          fi
-          echo "Args: ${args[@]-<none>}"
-          python palacio_category_snapshot_ramonly.py "${args[@]}"
-
-      # ───────── rclone: subir a Google Drive ─────────
+      # ───────── rclone: preparar Google Drive ─────────
       - name: Instalar rclone
         run: |
           sudo apt-get update
@@ -123,10 +100,40 @@ jobs:
           rclone version
           rclone listremotes
 
-      - name: Subir XLSX a Drive
+      - name: Bajar histórico (*.parquet) desde Drive a $SAVE_DIR
         run: |
-          if compgen -G "$SAVE_DIR/*.xlsx" > /dev/null; then
-            rclone copy "$SAVE_DIR" gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          mkdir -p "$SAVE_DIR"
+          # Trae sólo los parquet para que el script pueda comparar
+          rclone copy gdrive: "$SAVE_DIR" --include "*.parquet" -v --fast-list || true
+          ls -lh "$SAVE_DIR" || true
+
+      # ───────── Ejecutar scraper (usa históricos descargados) ─────────
+      - name: Ejecutar scraper
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.run_all }}" == "true" ]]; then
+              args+=(--all)
+            else
+              [[ -n "${{ inputs.category }}" ]] || { echo "run_all=false pero sin 'category'"; exit 1; }
+              args+=(-c "${{ inputs.category }}")
+            fi
+            [[ -n "${{ inputs.start }}"     ]] && args+=(--start "${{ inputs.start }}")
+            [[ -n "${{ inputs.page_size }}" ]] && args+=(--page-size "${{ inputs.page_size }}")
+            [[ -n "${{ inputs.page_step }}" ]] && args+=(--page-step "${{ inputs.page_step }}")
+            [[ -n "${{ inputs.max_pages }}" ]] && args+=(--max-pages "${{ inputs.max_pages }}")
+            [[ -n "${{ inputs.highlight }}" ]] && args+=(--highlight "${{ inputs.highlight }}")
           else
-            echo "No hay XLSX en $SAVE_DIR"
+            args+=(--all)
           fi
+          echo "Args: ${args[@]-<none>}"
+          python palacio_category_snapshot_ramonly.py "${args[@]}"
+
+      - name: Subir XLSX y PARQUET a Drive
+        run: |
+          rclone copy "$SAVE_DIR" gdrive: --include "*.xlsx" --include "*.parquet" \
+            --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          echo "Contenido en $SAVE_DIR:"
+          ls -lh "$SAVE_DIR" || true
