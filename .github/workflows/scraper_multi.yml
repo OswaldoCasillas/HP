@@ -9,8 +9,9 @@ on:
 jobs:
   group_a:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 5
     env:
+      PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
@@ -28,9 +29,15 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow fastparquet
+          fi
 
       - name: Instalar rclone
         run: |
@@ -61,15 +68,16 @@ jobs:
           fi
 
       - name: Preparar carpeta local y bajar histórico (.parquet)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
-          # Baja sólo los parquet históricos (si no hay, no falla).
           rclone copy gdrive: "$SAVE_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
           ls -lh "$SAVE_DIR" || true
 
-      - name: Ejecutar grupo A
+      - name: Ejecutar grupo A (–all)
         run: |
-          python palacio_group_a.py
+          python palacio_group_a.py --all
 
       - name: Subir resultados (XLSX+PARQUET) a Drive
         run: |
@@ -80,6 +88,7 @@ jobs:
     needs: group_a
     timeout-minutes: 360
     env:
+      PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
@@ -97,9 +106,15 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow fastparquet
+          fi
 
       - name: Instalar rclone
         run: |
@@ -130,14 +145,16 @@ jobs:
           fi
 
       - name: Preparar carpeta local y bajar histórico (.parquet)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
           rclone copy gdrive: "$SAVE_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
           ls -lh "$SAVE_DIR" || true
 
-      - name: Ejecutar grupo B
+      - name: Ejecutar grupo B (–all)
         run: |
-          python palacio_group_b.py
+          python palacio_group_b.py --all
 
       - name: Subir resultados (XLSX+PARQUET) a Drive
         run: |
@@ -148,6 +165,7 @@ jobs:
     needs: group_b
     timeout-minutes: 360
     env:
+      PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
@@ -165,9 +183,15 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow fastparquet
+          fi
 
       - name: Instalar rclone
         run: |
@@ -198,14 +222,16 @@ jobs:
           fi
 
       - name: Preparar carpeta local y bajar histórico (.parquet)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
           rclone copy gdrive: "$SAVE_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
           ls -lh "$SAVE_DIR" || true
 
-      - name: Ejecutar grupo C
+      - name: Ejecutar grupo C (–all)
         run: |
-          python palacio_group_c.py
+          python palacio_group_c.py --all
 
       - name: Subir resultados (XLSX+PARQUET) a Drive
         run: |
