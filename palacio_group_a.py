@@ -49,6 +49,8 @@ CATEGORIES = {
     "mujer":  {"base_url": "https://www.elpalaciodehierro.com/mujer/",  "default_page_size": 200, "default_page_step": 201, "default_max_pages": 1000, "prefix": "palacio_mujer"},
     "hombre": {"base_url": "https://www.elpalaciodehierro.com/hombre/", "default_page_size": 200, "default_page_step": 200, "default_max_pages":  200, "prefix": "palacio_hombre"},
     "hogar":  {"base_url": "https://www.elpalaciodehierro.com/hogar/",  "default_page_size": 200, "default_page_step": 201, "default_max_pages":  800, "prefix": "palacio_hogar"},
+    "ofertas": {"base_url": "https://www.elpalaciodehierro.com/ofertas/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 200, "prefix": "palacio_ofertas"},
+    
 }
 
 # ───────── Red/tiempos ─────────
