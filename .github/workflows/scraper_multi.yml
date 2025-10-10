@@ -1,0 +1,169 @@
+name: Palacio Scraper (multi-grupo)
+
+on:
+  schedule:
+    # 3:00 AM America/Mexico_City (aprox 09:00Z en invierno / 08:00Z en verano)
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  group-a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
+      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
+      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
+      SAVE_DIR:    /tmp/palacio_out/A
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+
+      - name: Ejecutar Grupo A
+        run: python palacio_group_a.py --all
+
+      - name: Instalar rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Configurar rclone
+        shell: bash
+        env:
+          RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
+          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
+            printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
+          else
+            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan SA_JSON o GDRIVE_FOLDER_ID"; exit 1; }
+            printf '%s' "$SA_JSON" > "$GITHUB_WORKSPACE/sa.json"
+            {
+              echo "[gdrive]"
+              echo "type = drive"
+              echo "scope = drive"
+              echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
+              echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
+            } > ~/.config/rclone/rclone.conf
+          fi
+
+      - name: Subir a Drive (Grupo A)
+        run: |
+          rclone copy /tmp/palacio_out/A gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+
+  group-b:
+    runs-on: ubuntu-latest
+    needs: group-a
+    timeout-minutes: 360
+    env:
+      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
+      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
+      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
+      SAVE_DIR:    /tmp/palacio_out/B
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+      - name: Ejecutar Grupo B (marcas)
+        run: python palacio_group_b.py --all
+      - name: Instalar rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+      - name: Configurar rclone
+        shell: bash
+        env:
+          RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
+          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
+            printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
+          else
+            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan SA_JSON o GDRIVE_FOLDER_ID"; exit 1; }
+            printf '%s' "$SA_JSON" > "$GITHUB_WORKSPACE/sa.json"
+            {
+              echo "[gdrive]"
+              echo "type = drive"
+              echo "scope = drive"
+              echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
+              echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
+            } > ~/.config/rclone/rclone.conf
+          fi
+      - name: Subir a Drive (Grupo B)
+        run: |
+          rclone copy /tmp/palacio_out/B gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+
+  group-c:
+    runs-on: ubuntu-latest
+    needs: group-b
+    timeout-minutes: 360
+    env:
+      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
+      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
+      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
+      SAVE_DIR:    /tmp/palacio_out/C
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+      - name: Ejecutar Grupo C
+        run: python palacio_group_c.py --all
+      - name: Instalar rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+      - name: Configurar rclone
+        shell: bash
+        env:
+          RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
+          SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+          if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
+            printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
+          else
+            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan SA_JSON o GDRIVE_FOLDER_ID"; exit 1; }
+            printf '%s' "$SA_JSON" > "$GITHUB_WORKSPACE/sa.json"
+            {
+              echo "[gdrive]"
+              echo "type = drive"
+              echo "scope = drive"
+              echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
+              echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
+            } > ~/.config/rclone/rclone.conf
+          fi
+      - name: Subir a Drive (Grupo C)
+        run: |
+          rclone copy /tmp/palacio_out/C gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
