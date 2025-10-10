@@ -49,8 +49,8 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ───────── Categorías (A) ─────────
 CATEGORIES = {
-    "mujer": {"base_url": "https://www.elpalaciodehierro.com/mujer/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 1000, "prefix": "palacio_mujer"},
-    "hogar": {"base_url": "https://www.elpalaciodehierro.com/hogar/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_hogar"},
+    "mujer": {"base_url": "https://www.elpalaciodehierro.com/mujer/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 10, "prefix": "palacio_mujer"},
+    "hogar": {"base_url": "https://www.elpalaciodehierro.com/hogar/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 8, "prefix": "palacio_hogar"},
 }
 
 # ───────── Red/tiempos ─────────
