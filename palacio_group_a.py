@@ -501,7 +501,7 @@ def main():
             print("Válidas:", ", ".join(CATEGORIES.keys()))
             return
         run_single_category(args.category, CATEGORIES[args.category], args)
-)
+
 
 if __name__ == "__main__":
     main()
