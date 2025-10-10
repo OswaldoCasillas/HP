@@ -464,13 +464,20 @@ def parse_args():
     return args
 
 def pick_category_interactively():
-    print("Elige una categoría:"); keys = list(CATEGORIES.keys())
-    for i,k in enumerate(keys, start=1): print(f"  {i}) {k}  →  {CATEGORIES[k]['base_url']}")
+    print("Elige una categoría:")
+    keys = list(CATEGORIES.keys())
+    for i, k in enumerate(keys, start=1):
+        print(f"  {i}) {k}  →  {CATEGORIES[k]['base_url']}")
     try:
         idx = int(input(f"Número (1..{len(keys)}): ").strip())
-        if 1 <= idx <= len(keys): return keys[idx-1]
-    except Exception: pass
-    print("Opción inválida, usando 'mujer'."); return "mujer"
+        if 1 <= idx <= len(keys):
+            return keys[idx-1]
+    except Exception:
+        pass
+    # Fallback seguro: primera del grupo actual
+    print(f"Opción inválida, usando '{keys[0]}'.")
+    return keys[0]
+
 
 def main():
     args = parse_args()
