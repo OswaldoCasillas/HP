@@ -481,18 +481,27 @@ def pick_category_interactively():
 
 def main():
     args = parse_args()
+
+    # En CI, si no se especificó nada, forza --all
+    if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) and not args.all and not args.category:
+        args.all = True
+
     if args.all:
-        print("▶ Ejecutando TODAS A…")
-        for idx,(cat_key,cfg) in enumerate(CATEGORIES.items(), start=1):
+        print("▶ Ejecutando TODAS las categorías del grupo…")
+        for idx, (cat_key, cfg) in enumerate(CATEGORIES.items(), start=1):
             run_single_category(cat_key, cfg, args)
             if idx < len(CATEGORIES):
                 cat_pause = random.uniform(0.6, 1.5)
                 if random.random() < 0.2: cat_pause += random.uniform(0.8, 1.6)
                 print(f"⏸️ Pausa entre categorías: {cat_pause:.2f}s…"); time.sleep(cat_pause)
-        print("🎉 Grupo A listo.")
+        print("🎉 Terminaron todas.")
     else:
-        cat_key = args.category or pick_category_interactively()
-        run_single_category(cat_key, CATEGORIES[cat_key], args)
+        if args.category not in CATEGORIES:
+            print(f"⚠️ La categoría '{args.category}' no pertenece a este grupo.")
+            print("Válidas:", ", ".join(CATEGORIES.keys()))
+            return
+        run_single_category(args.category, CATEGORIES[args.category], args)
+
 
 if __name__ == "__main__":
     main()
