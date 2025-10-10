@@ -1,43 +1,50 @@
-name: Palacio Scraper (multi-grupo)
+name: Palacio Scraper (A→B→C, RAM + Email + Drive)
 
 on:
   schedule:
-    # 3:00 AM America/Mexico_City (aprox 09:00Z en invierno / 08:00Z en verano)
+    # 3:00 AM America/Mexico_City ≈ 09:00Z (invierno) / 08:00Z (verano).
     - cron: "0 9 * * *"
   workflow_dispatch: {}
 
+env:
+  SAVE_DIR: /tmp/palacio_out
+  EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
+  EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
+  EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+  EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+  EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+  EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
+
 jobs:
-  group-a:
+  scraper-a:
+    name: Grupo A (mujer, hogar)
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    env:
-      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
-      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
-      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
-      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
-      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
-      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
-      SAVE_DIR:    /tmp/palacio_out/A
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Instalar dependencias
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+          pip install requests pandas beautifulsoup4 xlsxwriter
 
-      - name: Ejecutar Grupo A
-        run: python palacio_group_a.py --all
+      - name: Run A --all
+        run: |
+          mkdir -p "$SAVE_DIR"
+          python palacio_scraper_A.py --all
 
-      - name: Instalar rclone
+      - name: Install rclone
         run: |
           sudo apt-get update
           sudo apt-get install -y rclone
 
-      - name: Configurar rclone
+      - name: Configure rclone
         shell: bash
         env:
           RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
@@ -49,7 +56,7 @@ jobs:
           if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
             printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
           else
-            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan SA_JSON o GDRIVE_FOLDER_ID"; exit 1; }
+            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan GDRIVE_SERVICE_ACCOUNT_JSON o GDRIVE_FOLDER_ID"; exit 1; }
             printf '%s' "$SA_JSON" > "$GITHUB_WORKSPACE/sa.json"
             {
               echo "[gdrive]"
@@ -59,38 +66,47 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
+          rclone version
+          rclone listremotes
 
-      - name: Subir a Drive (Grupo A)
+      - name: Upload XLSX to Drive
         run: |
-          rclone copy /tmp/palacio_out/A gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          if compgen -G "$SAVE_DIR/*.xlsx" > /dev/null; then
+            rclone copy "$SAVE_DIR" gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          else
+            echo "No hay XLSX en $SAVE_DIR"
+          fi
 
-  group-b:
+  scraper-b:
+    name: Grupo B (hombre)
     runs-on: ubuntu-latest
-    needs: group-a
     timeout-minutes: 360
-    env:
-      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
-      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
-      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
-      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
-      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
-      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
-      SAVE_DIR:    /tmp/palacio_out/B
+    needs: scraper-a
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - name: Instalar dependencias
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
-      - name: Ejecutar Grupo B (marcas)
-        run: python palacio_group_b.py --all
-      - name: Instalar rclone
+          pip install requests pandas beautifulsoup4 xlsxwriter
+
+      - name: Run B --all
+        run: |
+          mkdir -p "$SAVE_DIR"
+          python palacio_scraper_B.py --all
+
+      - name: Install rclone
         run: |
           sudo apt-get update
           sudo apt-get install -y rclone
-      - name: Configurar rclone
+
+      - name: Configure rclone
         shell: bash
         env:
           RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
@@ -102,7 +118,7 @@ jobs:
           if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
             printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
           else
-            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan SA_JSON o GDRIVE_FOLDER_ID"; exit 1; }
+            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan GDRIVE_SERVICE_ACCOUNT_JSON o GDRIVE_FOLDER_ID"; exit 1; }
             printf '%s' "$SA_JSON" > "$GITHUB_WORKSPACE/sa.json"
             {
               echo "[gdrive]"
@@ -112,37 +128,47 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-      - name: Subir a Drive (Grupo B)
-        run: |
-          rclone copy /tmp/palacio_out/B gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          rclone version
+          rclone listremotes
 
-  group-c:
+      - name: Upload XLSX to Drive
+        run: |
+          if compgen -G "$SAVE_DIR/*.xlsx" > /dev/null; then
+            rclone copy "$SAVE_DIR" gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          else
+            echo "No hay XLSX en $SAVE_DIR"
+          fi
+
+  scraper-c:
+    name: Grupo C (resto)
     runs-on: ubuntu-latest
-    needs: group-b
     timeout-minutes: 360
-    env:
-      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
-      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
-      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
-      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
-      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
-      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
-      SAVE_DIR:    /tmp/palacio_out/C
+    needs: scraper-b
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - name: Instalar dependencias
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
-      - name: Ejecutar Grupo C
-        run: python palacio_group_c.py --all
-      - name: Instalar rclone
+          pip install requests pandas beautifulsoup4 xlsxwriter
+
+      - name: Run C --all
+        run: |
+          mkdir -p "$SAVE_DIR"
+          python palacio_scraper_C.py --all
+
+      - name: Install rclone
         run: |
           sudo apt-get update
           sudo apt-get install -y rclone
-      - name: Configurar rclone
+
+      - name: Configure rclone
         shell: bash
         env:
           RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
@@ -154,7 +180,7 @@ jobs:
           if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
             printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
           else
-            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan SA_JSON o GDRIVE_FOLDER_ID"; exit 1; }
+            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan GDRIVE_SERVICE_ACCOUNT_JSON o GDRIVE_FOLDER_ID"; exit 1; }
             printf '%s' "$SA_JSON" > "$GITHUB_WORKSPACE/sa.json"
             {
               echo "[gdrive]"
@@ -164,6 +190,13 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-      - name: Subir a Drive (Grupo C)
+          rclone version
+          rclone listremotes
+
+      - name: Upload XLSX to Drive
         run: |
-          rclone copy /tmp/palacio_out/C gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          if compgen -G "$SAVE_DIR/*.xlsx" > /dev/null; then
+            rclone copy "$SAVE_DIR" gdrive: --create-empty-src-dirs -v --retries 3 --transfers 4 --checkers 8
+          else
+            echo "No hay XLSX en $SAVE_DIR"
+          fi
