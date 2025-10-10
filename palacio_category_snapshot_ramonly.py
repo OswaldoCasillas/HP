@@ -1,7 +1,8 @@
 # palacio_category_snapshot_ramonly.py
-# Scraper Palacio → ahora: histórico real con NEW/CHANGES/REMOVED contra el snapshot previo por categoría.
+# Scraper Palacio → ahora: histórico real con NEW/CHANGES/REMOVED contra el snapshot previo por categoría
+# y un CONSOLIDADO (NEW + CHANGES) al correr --all.
 # - Guarda XLSX + PARQUET en SAVE_DIR (env), adjunta XLSX por correo.
-# - Si hay PARQUET previo en SAVE_DIR que matchea el prefijo, calcula diferencias.
+# - Lee PARQUET previo en SAVE_DIR por prefijo para calcular diferencias.
 # - "marcas": sigue omitiendo image_url si la columna existe.
 # - Tolerancia para cambios numéricos: 1 centavo.
 
@@ -10,6 +11,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 from email.message import EmailMessage
+from mimetypes import guess_type
 
 import requests
 import pandas as pd
@@ -40,7 +42,6 @@ def send_email(subject: str, body: str, to_addr, attachments=None):
     for (fname, data, mime) in (attachments or []):
         mt, st = (mime.split("/",1) if mime else ("application","octet-stream"))
         msg.add_attachment(data, maintype=mt, subtype=st, filename=fname)
-    import smtplib
     with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as smtp:
         if EMAIL_DEBUG: smtp.set_debuglevel(1)
         smtp.ehlo(); smtp.starttls(); smtp.ehlo(); smtp.login(EMAIL_USER, EMAIL_PASS)
@@ -58,16 +59,12 @@ CATEGORIES = {
     "electronica": {"base_url": "https://www.elpalaciodehierro.com/electronica/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 400, "prefix": "palacio_electronica"},
     "deportes": {"base_url": "https://www.elpalaciodehierro.com/deportes/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_deportes"},
     "gourmet": {"base_url": "https://www.elpalaciodehierro.com/gourmet/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_gourmet"},
-    "nuevos-productos": {"base_url": "https://www.elpalaciodehierro.com/nuevos-productos/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_nuevos_productos"},
     "mujer": {"base_url": "https://www.elpalaciodehierro.com/mujer/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 1000, "prefix": "palacio_mujer"},
-    "productos-liquidacion": {"base_url": "https://www.elpalaciodehierro.com/productos-liquidacion/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 80, "prefix": "palacio_productos_liquidacion"},
     "hombre": {"base_url": "https://www.elpalaciodehierro.com/hombre/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_hombre"},
     "calzado": {"base_url": "https://www.elpalaciodehierro.com/calzado/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_calzado"},
-    "hogar": {"base_url": "https://www.elpalaciodehierro.com/hogar/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_hogar"},
     "juguetes": {"base_url": "https://www.elpalaciodehierro.com/juguetes/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_juguetes"},
     "categorias": {"base_url": "https://www.elpalaciodehierro.com/categorias/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_categorias"},
     "tendencias": {"base_url": "https://www.elpalaciodehierro.com/tendencias/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_tendencias"},
-    "más vendido": {"base_url": "https://www.elpalaciodehierro.com/lo-mas-vendido/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_vendido"},
 }
 
 # ──────────────── Red/tiempos ────────────────
@@ -300,7 +297,6 @@ def _changes_merge(prev_df: pd.DataFrame, cur_df: pd.DataFrame):
     return key, changes, new_items, removed_items
 
 def build_xlsx_bytes(df: pd.DataFrame, prev_df: pd.DataFrame|None, out_prefix: str) -> bytes:
-    key = "product_id"
     if prev_df is not None and not prev_df.empty and not df.empty:
         key, changes, new_items, removed_items = _changes_merge(prev_df, df)
     else:
@@ -338,10 +334,12 @@ def build_xlsx_bytes(df: pd.DataFrame, prev_df: pd.DataFrame|None, out_prefix: s
             if "discount_pct" in cols and not df_ref.empty:
                 last_row = len(df_ref) + 1
                 col_letter = chr(65 + cols.index("discount_pct"))
-                for thresh, hexcolor in HIGHLIGHT_BANDS:
-                    fmt = wb.add_format({"bg_color": hexcolor})
-                    ws.conditional_format(1, 0, last_row, len(cols)-1,
-                        {"type":"formula","criteria":f"=${col_letter}2>={thresh}","format":fmt,"stop_if_true":True})
+                ws.conditional_format(1, 0, last_row, len(cols)-1,
+                    {"type":"formula","criteria":f"=${col_letter}2>=50","format":wb.add_format({"bg_color":"#FFF59D"})})
+                ws.conditional_format(1, 0, last_row, len(cols)-1,
+                    {"type":"formula","criteria":f"=${col_letter}2>=60","format":wb.add_format({"bg_color":"#FFE0B2"})})
+                ws.conditional_format(1, 0, last_row, len(cols)-1,
+                    {"type":"formula","criteria":f"=${col_letter}2>=70","format":wb.add_format({"bg_color":"#FFCDD2"})})
 
         def fmt_simple(ws, df_ref):
             cols = list(df_ref.columns) if df_ref is not None and not df_ref.empty else ["info"]
@@ -355,6 +353,43 @@ def build_xlsx_bytes(df: pd.DataFrame, prev_df: pd.DataFrame|None, out_prefix: s
 
     buf.seek(0)
     return buf.read()
+
+# ──────────────── Consolidado cross-categoría ────────────────
+CONSOLIDATED_NEW = []       # lista de DataFrames etiquetados
+CONSOLIDATED_CHANGES = []   # lista de DataFrames etiquetados
+
+def _write_consolidated_xlsx(save_dir: str | Path, stamp: str):
+    save_dir = str(save_dir)
+    if not CONSOLIDATED_NEW and not CONSOLIDATED_CHANGES:
+        print("ℹ️ No hay datos para consolidar.")
+        return None
+    df_new = (pd.concat(CONSOLIDATED_NEW, ignore_index=True) if CONSOLIDATED_NEW else
+              pd.DataFrame({"info": ["Sin nuevos en esta corrida"]}))
+    df_chg = (pd.concat(CONSOLIDATED_CHANGES, ignore_index=True) if CONSOLIDATED_CHANGES else
+              pd.DataFrame({"info": ["Sin cambios en esta corrida"]}))
+    out_name = f"palacio_consolidado_{stamp}.xlsx"
+    out_path = os.path.join(save_dir, out_name)
+    with pd.ExcelWriter(out_path, engine="xlsxwriter") as w:
+        df_new.to_excel(w, index=False, sheet_name="NEW")
+        df_chg.to_excel(w, index=False, sheet_name="CHANGES")
+        wb = w.book
+        money  = wb.add_format({"num_format": "#,##0.00"})
+        pctfmt = wb.add_format({'num_format': '0.00"%"'})
+        def _fmt(ws, df):
+            cols = list(df.columns)
+            ws.set_column(0, len(cols)-1, 18)
+            for nm in ["list_price","sale_price","list_price_old","list_price_new","sale_price_old","sale_price_new"]:
+                if nm in cols:
+                    i = cols.index(nm); ws.set_column(i, i, 14, money)
+            for nm in ["discount_pct","discount_pct_old","discount_pct_new"]:
+                if nm in cols:
+                    i = cols.index(nm); ws.set_column(i, i, 12, pctfmt)
+            ws.autofilter(0, 0, max(1, len(df)), max(0, len(cols)-1))
+            ws.freeze_panes(1, 0)
+        _fmt(w.sheets["NEW"], df_new if isinstance(df_new, pd.DataFrame) else pd.DataFrame())
+        _fmt(w.sheets["CHANGES"], df_chg if isinstance(df_chg, pd.DataFrame) else pd.DataFrame())
+    print(f"✅ Consolidado guardado: {out_path}")
+    return out_path
 
 # ──────────────── Runner ────────────────
 COLUMNS_EXPORT = ["product_id","sku","name","brand","category","department","price_currency",
@@ -424,36 +459,52 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     if (cfg.get("omit_image_url") or cat_key == "marcas") and "image_url" in df.columns:
         df.drop(columns=["image_url"], inplace=True)
 
-    # histórico previo (si rclone ya bajó .parquet al SAVE_DIR)
+    # histórico previo (si el workflow ya tiene .parquet en SAVE_DIR)
     prev_pq = _latest_previous_parquet(out_prefix, SAVE_DIR)
     prev_df = None
     if prev_pq and prev_pq.exists():
         try:
             prev_df = pd.read_parquet(prev_pq)
             _normalize_numeric(prev_df)
-            # normaliza claves
             for d in (df, prev_df):
                 if "product_id" in d.columns: d["product_id"] = d["product_id"].astype("string")
                 if "sku" in d.columns: d["sku"] = d["sku"].astype("string")
         except Exception as e:
             print(f"⚠️ No pude leer previo {prev_pq.name}: {e}")
 
+    # Para CONSOLIDADO: calcular cambios/new aquí
+    if prev_df is not None and not prev_df.empty:
+        _, changes_df, new_df, _removed_df = _changes_merge(prev_df, df)
+    else:
+        changes_df = pd.DataFrame()
+        new_df = df.copy()
+
+    if not new_df.empty:
+        new_df = new_df.copy()
+        new_df.insert(0, "category", cat_key)
+        new_df.insert(1, "captured_at", captured_at)
+        CONSOLIDATED_NEW.append(new_df)
+
+    if not changes_df.empty:
+        chg = changes_df.copy()
+        chg.insert(0, "category", cat_key)
+        chg.insert(1, "captured_at", captured_at)
+        CONSOLIDATED_CHANGES.append(chg)
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     xlsx_bytes = build_xlsx_bytes(df, prev_df, out_prefix)
     xlsx_name  = f"{out_prefix}_snapshot_{stamp}.xlsx"
     pq_name    = f"{out_prefix}_snapshot_{stamp}.parquet"
 
-    # Guarda en disco para el workflow (y para histórico en Drive)
     (SAVE_DIR / xlsx_name).write_bytes(xlsx_bytes)
     df.to_parquet(SAVE_DIR / pq_name, index=False)
 
-    # correo
     total_rows = len(df)
     big_disc = int((df.get("discount_pct", pd.Series(dtype=float)).fillna(0) >= (args.highlight or HIGHLIGHT_DISCOUNT)).sum())
     subj = f"[Scraper] {out_prefix} listo (RAM-only {stamp})"
     body = (f"Categoría: {cat_key}\nFilas: {total_rows}\n≥{args.highlight or HIGHLIGHT_DISCOUNT}% desc.: {big_disc}\n"
             f"Adjunto: {xlsx_name}\nHistórico: {'sí' if prev_df is not None else 'no (primer snapshot)'}\n"
-            f"Guardado: {SAVE_DIR}")
+            f"Guardado en: {SAVE_DIR}")
     send_email(subj, body, EMAIL_TO_LIST, attachments=[(xlsx_name, xlsx_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")])
 
     return {"category": cat_key, "ok": True, "rows": total_rows, "big_disc": big_disc}
@@ -484,12 +535,31 @@ def main():
     args = parse_args()
     if args.all:
         print("▶ Ejecutando TODAS las categorías…")
+        results = []
         for idx,(cat_key,cfg) in enumerate(CATEGORIES.items(), start=1):
-            run_single_category(cat_key, cfg, args)
+            res = run_single_category(cat_key, cfg, args); results.append(res)
             if idx < len(CATEGORIES):
                 cat_pause = random.uniform(0.6, 1.5)
                 if random.random() < 0.2: cat_pause += random.uniform(0.8, 1.6)
                 print(f"⏸️ Pausa entre categorías: {cat_pause:.2f}s…"); time.sleep(cat_pause)
+
+        # Consolidado NEW + CHANGES
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        consolidated_path = _write_consolidated_xlsx(SAVE_DIR, stamp)
+        if consolidated_path:
+            try:
+                with open(consolidated_path, "rb") as f:
+                    data = f.read()
+                mime = guess_type(consolidated_path)[0] or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                send_email(
+                    "[Scraper] Consolidado NEW+CHANGES",
+                    "Adjunto el consolidado de esta corrida (todas las categorías alcanzadas).",
+                    EMAIL_TO_LIST,
+                    attachments=[(os.path.basename(consolidated_path), data, mime)]
+                )
+            except Exception as e:
+                print(f"⚠️ No se pudo adjuntar el consolidado al correo: {e}")
+
         print("🎉 Terminaron todas.")
     else:
         cat_key = args.category or pick_category_interactively()
