@@ -2,7 +2,7 @@ name: Palacio Scraper (A→B→C, RAM + Email + Drive)
 
 on:
   schedule:
-    # 3:00 AM America/Mexico_City ≈ 09:00Z (invierno) / 08:00Z (verano).
+    # 3:00 AM America/Mexico_City ≈ 09:00 UTC (invierno)
     - cron: "0 9 * * *"
   workflow_dispatch: {}
 
@@ -17,7 +17,7 @@ env:
 
 jobs:
   scraper-a:
-    name: Grupo A (mujer, hogar)
+    name: Grupo A
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -32,12 +32,23 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+          fi
+
+      - name: List repo files (debug)
+        run: |
+          pwd
+          ls -la
 
       - name: Run A --all
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
-          python palacio_scraper_A.py --all
+          python palacio_group_a.py --all
 
       - name: Install rclone
         run: |
@@ -66,8 +77,6 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-          rclone version
-          rclone listremotes
 
       - name: Upload XLSX to Drive
         run: |
@@ -78,7 +87,7 @@ jobs:
           fi
 
   scraper-b:
-    name: Grupo B (hombre)
+    name: Grupo B
     runs-on: ubuntu-latest
     timeout-minutes: 360
     needs: scraper-a
@@ -94,12 +103,23 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+          fi
+
+      - name: List repo files (debug)
+        run: |
+          pwd
+          ls -la
 
       - name: Run B --all
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
-          python palacio_scraper_B.py --all
+          python palacio_group_b.py --all
 
       - name: Install rclone
         run: |
@@ -128,8 +148,6 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-          rclone version
-          rclone listremotes
 
       - name: Upload XLSX to Drive
         run: |
@@ -140,7 +158,7 @@ jobs:
           fi
 
   scraper-c:
-    name: Grupo C (resto)
+    name: Grupo C
     runs-on: ubuntu-latest
     timeout-minutes: 360
     needs: scraper-b
@@ -156,12 +174,23 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4 xlsxwriter
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow
+          fi
+
+      - name: List repo files (debug)
+        run: |
+          pwd
+          ls -la
 
       - name: Run C --all
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
-          python palacio_scraper_C.py --all
+          python palacio_group_c.py --all
 
       - name: Install rclone
         run: |
@@ -190,8 +219,6 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-          rclone version
-          rclone listremotes
 
       - name: Upload XLSX to Drive
         run: |
