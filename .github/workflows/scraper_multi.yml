@@ -9,7 +9,7 @@ on:
 jobs:
   group_a:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
