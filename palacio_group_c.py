@@ -57,16 +57,12 @@ CATEGORIES = {
     "productos-liquidacion": {"base_url": "https://www.elpalaciodehierro.com/productos-liquidacion/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 80, "prefix": "palacio_productos_liquidacion"},
     "calzado": {"base_url": "https://www.elpalaciodehierro.com/calzado/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_calzado"},
     "juguetes": {"base_url": "https://www.elpalaciodehierro.com/juguetes/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_juguetes"},
-    "categorias": {"base_url": "https://www.elpalaciodehierro.com/categorias/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_categorias"},
-    "tendencias": {"base_url": "https://www.elpalaciodehierro.com/tendencias/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_tendencias"},
     "más vendido": {"base_url": "https://www.elpalaciodehierro.com/lo-mas-vendido/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_vendido"},
     "electronica-tablets": {"base_url": "https://www.elpalaciodehierro.com/electronica/tablets/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_electronica_tablets"},
     "disenadores": {"base_url": "https://www.elpalaciodehierro.com/disenadores/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_disenadores"},
     "casapalacio": {"base_url": "https://www.elpalaciodehierro.com/casapalacio/", "default_page_size": 200, "default_page_step": 201, "default_max_pages": 800, "prefix": "palacio_casapalacio"},
     "salas": {"base_url": "https://www.elpalaciodehierro.com/hogar/muebles/salas/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 200, "prefix": "palacio_salas"},
-    "mujer-multimarcas": {"base_url": "https://www.elpalaciodehierro.com/mujer/adolfo-dominguez%7Cburberry%7Ccoach2%7Cgerard-darel%7Chugo-boss2%7Cjimmy-choo2%7Clauren%7Clauren-ralph-lauren%7Cpolo-ralph-lauren2%7Cpolo-woman%7Cpucci%7Cralph-lauren%7Cray-ban%7Cugg/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_mujer_multimarcas"},
-    "hombre-multimarcas": {"base_url": "https://www.elpalaciodehierro.com/hombre/ropa/adolfo-dominguez%7Cboss2%7Cburberry%7Ccalderoni%7Ccoach2%7Cecoalf%7Chugo-boss2%7Cpolo-ralph-lauren2%7Cralph-lauren%7Csaint-laurent-paris%7Cugg/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 80, "prefix": "palacio_hombre_multimarcas"},
-}
+   }
 
 # ───────── Red/tiempos ─────────
 CONNECT_TIMEOUT = 20
