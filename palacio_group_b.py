@@ -50,7 +50,7 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 # ───────── Categorías (A) ─────────
 # Solo marcas (omitimos image_url)
 CATEGORIES = {
-    "marcas": {"base_url": "https://www.elpalaciodehierro.com/marcas/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 400, "prefix": "palacio_marcas", "omit_image_url": True}
+    "marcas": {"base_url": "https://www.elpalaciodehierro.com/marcas/", "default_page_size": 200, "default_page_step": 200, "default_max_pages": 300, "prefix": "palacio_marcas", "omit_image_url": True}
 }
 
 # ───────── Red/tiempos ─────────
