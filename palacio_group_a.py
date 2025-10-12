@@ -22,6 +22,23 @@ EMAIL_TO   = os.getenv("EMAIL_TO", "")
 EMAIL_DEBUG = os.getenv("EMAIL_DEBUG", "0") not in ("", "0", "false", "False")
 EMAIL_TO_LIST = [e.strip() for e in re.split(r"[;,]", EMAIL_TO) if e.strip()]
 
+# ───────────────── Alertas por marca (se leen de secrets/env) ─────────────────
+ALERT_BRANDS_RAW = os.getenv("ALERT_BRANDS", "").strip()
+ALERT_ABS_TOL = float(os.getenv("ALERT_ABS_TOL", "0.01"))  # tolerancia cambios, 1 centavo por default
+
+def _normalize_list(raw: str):
+    if not raw:
+        return []
+    import re
+    items = [x.strip() for x in re.split(r"[;,]", raw) if x.strip()]
+    # a minúsculas para match case-insensitive
+    return [i.lower() for i in items]
+
+ALERT_BRANDS = _normalize_list(ALERT_BRANDS_RAW)
+
+def _hay_marcas_configuradas():
+    return len(ALERT_BRANDS) > 0
+
 def send_email(subject: str, body: str, to_addr, attachments=None):
     if not EMAIL_USER or not EMAIL_PASS or not EMAIL_TO_LIST:
         print("⚠️ EMAIL_* incompletos: no se envía correo.")
