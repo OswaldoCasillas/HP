@@ -378,6 +378,111 @@ def build_xlsx_bytes(df: pd.DataFrame, prev_df: pd.DataFrame|None, out_prefix: s
 COLUMNS_EXPORT = ["product_id","sku","name","brand","category","department","price_currency",
                   "list_price","sale_price","discount_pct","availability","image_url","enlace",
                   "page_start","page_idx","captured_at"]
+# ───────────────── Helpers de difs y alertas ─────────────────
+def _compute_diffs(prev_df: pd.DataFrame | None, cur_df: pd.DataFrame):
+    """Devuelve (key, changes, new_items).
+       Usa _changes_merge si existe el previo; si no hay previo:
+       - changes: vacío (o info)
+       - new_items: todo cur_df
+    """
+    if prev_df is not None and not prev_df.empty and not cur_df.empty:
+        key, changes, new_items, _removed = _changes_merge(prev_df, cur_df)
+        # filtrar cambios triviales por tolerancia
+        def _chg_num_ok(row):
+            def dif(a, b):
+                if pd.isna(a) or pd.isna(b): 
+                    return False
+                try:
+                    return abs(float(a) - float(b)) > ALERT_ABS_TOL
+                except Exception:
+                    return a != b
+            return (
+                dif(row.get("list_price_old"), row.get("list_price_new")) or
+                dif(row.get("sale_price_old"), row.get("sale_price_new")) or
+                dif(row.get("discount_pct_old"), row.get("discount_pct_new")) or
+                (pd.isna(row.get("sale_price_old")) ^ pd.isna(row.get("sale_price_new")))
+            )
+        if not changes.empty:
+            changes = changes[[c for c in changes.columns if not c.endswith("_old") or c.endswith("_new") or True]]
+            if "list_price_old" in changes.columns:  # aplicar filtro tolerancia
+                changes = changes[changes.apply(_chg_num_ok, axis=1)]
+        return key, (changes if not changes.empty else pd.DataFrame()), (new_items if not new_items.empty else pd.DataFrame())
+    else:
+        return ("product_id", pd.DataFrame(), cur_df.copy())
+
+def _match_brand_any(s: str) -> bool:
+    if not s:
+        return False
+    s_low = str(s).lower()
+    return any(b in s_low for b in ALERT_BRANDS)
+
+def _filter_alert_hits_new(new_items: pd.DataFrame) -> pd.DataFrame:
+    if new_items is None or new_items.empty or not _hay_marcas_configuradas():
+        return pd.DataFrame()
+    cols = new_items.columns
+    brand_col = "brand" if "brand" in cols else None
+    name_col  = "name"  if "name"  in cols else None
+    if not brand_col and not name_col:
+        return pd.DataFrame()
+    mask = False
+    if brand_col:
+        mask = new_items[brand_col].apply(_match_brand_any)
+    if name_col:
+        mask = mask | new_items[name_col].apply(_match_brand_any) if isinstance(mask, pd.Series) else new_items[name_col].apply(_match_brand_any)
+    hits = new_items[mask].copy()
+    return hits
+
+def _filter_alert_hits_changes(changes: pd.DataFrame) -> pd.DataFrame:
+    if changes is None or changes.empty or not _hay_marcas_configuradas():
+        return pd.DataFrame()
+    # Buscar columnas de brand/name en cambios (suelen venir con _new/_old)
+    cand_cols = [c for c in changes.columns if c.startswith("brand_") or c.startswith("name_")]
+    if not cand_cols:
+        return pd.DataFrame()
+    def _row_hit(r):
+        for c in cand_cols:
+            if _match_brand_any(r.get(c)):
+                return True
+        return False
+    hits = changes[changes.apply(_row_hit, axis=1)].copy()
+    return hits
+
+def _send_brand_alerts(cat_key: str, hits_new: pd.DataFrame, hits_changes: pd.DataFrame):
+    """Envía 1 correo por categoría si hubo hits (new o changes)."""
+    if not _hay_marcas_configuradas():
+        return
+    if (hits_new is None or hits_new.empty) and (hits_changes is None or hits_changes.empty):
+        return
+    lines = [f"Alertas por marca en categoría: {cat_key}"]
+    if hits_new is not None and not hits_new.empty:
+        lines.append("\nNUEVOS (coinciden con marcas vigiladas):")
+        sample_cols = [c for c in ("product_id","brand","name","sale_price","discount_pct","enlace") if c in hits_new.columns]
+        lines.extend([" - " + " | ".join([str(r.get(c,"")) for c in sample_cols]) for _, r in hits_new.head(30).iterrows()])
+        if len(hits_new) > 30:
+            lines.append(f" ... y {len(hits_new)-30} más")
+    if hits_changes is not None and not hits_changes.empty:
+        lines.append("\nCAMBIOS (coinciden con marcas vigiladas):")
+        # Escoge columnas relevantes
+        keep = []
+        for base in ("product_id","brand","name","list_price","sale_price","discount_pct"):
+            old, new = f"{base}_old", f"{base}_new"
+            if old in hits_changes.columns or new in hits_changes.columns:
+                keep.extend([c for c in (old,new) if c in hits_changes.columns])
+        if "enlace_new" in hits_changes.columns:
+            keep.append("enlace_new")
+        elif "enlace_old" in hits_changes.columns:
+            keep.append("enlace_old")
+        view = hits_changes[keep] if keep else hits_changes
+        for _, r in view.head(30).iterrows():
+            lines.append(" - " + " | ".join([f"{c}={r.get(c,'')}" for c in view.columns]))
+        if len(hits_changes) > 30:
+            lines.append(f" ... y {len(hits_changes)-30} más")
+    body = "\n".join(lines)
+    subj = f"[Scraper][ALERTA] {cat_key}: coincidencias con marcas vigiladas"
+    try:
+        send_email(subj, body, EMAIL_TO_LIST, attachments=None)
+    except Exception as e:
+        print(f"⚠️ No se pudo enviar alerta por marca: {e}")
 
 def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     session = build_session()
