@@ -558,6 +558,22 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
         except Exception as e:
             print(f"⚠️ No pude leer previo {prev_pq.name}: {e}")
 
+        # === Alertas por marca: NEW / CHANGES de esta categoría ===
+    try:
+        key_for_diffs, changes_df, new_df = _compute_diffs(prev_df, df)
+        # Normaliza y evita "cannot insert ... already exists"
+        if not new_df.empty and "category" not in new_df.columns:
+            new_df.insert(0, "category", cat_key)
+        if not changes_df.empty and "category" not in changes_df.columns:
+            changes_df.insert(0, "category", cat_key)
+
+        hits_new = _filter_alert_hits_new(new_df)
+        hits_changes = _filter_alert_hits_changes(changes_df)
+        _send_brand_alerts(cat_key, hits_new, hits_changes)
+    except Exception as e:
+        print(f"⚠️ Alerta por marca falló en {cat_key}: {e}")
+
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     xlsx_bytes = build_xlsx_bytes(df, prev_df, out_prefix, cat_key)
     xlsx_name  = f"{out_prefix}_snapshot_{stamp}.xlsx"
