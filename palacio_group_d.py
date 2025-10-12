@@ -546,21 +546,46 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     df = pd.DataFrame(all_rows, columns=COLUMNS_EXPORT)
     _normalize_numeric(df)
 
-    # lee histórico previo
+       # ───────── lee histórico previo ─────────
     prev_pq = _latest_previous_parquet(out_prefix, SAVE_DIR)
     prev_df = None
     if prev_pq and prev_pq.exists():
         try:
             prev_df = pd.read_parquet(prev_pq)
             _normalize_numeric(prev_df)
-            for d in (df, prev_df):
-                if "product_id" in d.columns: d["product_id"] = d["product_id"].astype("string")
-                if "sku" in d.columns: d["sku"] = d["sku"].astype("string")
         except Exception as e:
             print(f"⚠️ No pude leer previo {prev_pq.name}: {e}")
 
+    # Normaliza claves para comparar (aunque no haya previo)
+    if prev_df is not None:
+        iter_df = (df, prev_df)
+    else:
+        iter_df = (df,)
+    for d in iter_df:
+        if "product_id" in d.columns:
+            d["product_id"] = d["product_id"].astype("string")
+        if "sku" in d.columns:
+            d["sku"] = d["sku"].astype("string")
+
+    # === Alertas por marca: NEW / CHANGES de esta categoría ===
+    try:
+        key_for_diffs, changes_df, new_df = _compute_diffs(prev_df, df)
+
+        # Evita "cannot insert ..., already exists"
+        if not new_df.empty and "category" not in new_df.columns:
+            new_df.insert(0, "category", cat_key)
+        if not changes_df.empty and "category" not in changes_df.columns:
+            changes_df.insert(0, "category", cat_key)
+
+        hits_new = _filter_alert_hits_new(new_df)
+        hits_changes = _filter_alert_hits_changes(changes_df)
+        _send_brand_alerts(cat_key, hits_new, hits_changes)
+    except Exception as e:
+        print(f"⚠️ Alerta por marca falló en {cat_key}: {e}")
+
+    # ───────── generar y guardar snapshot ─────────
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    xlsx_bytes = build_xlsx_bytes(df, prev_df, out_prefix, cat_key)
+    xlsx_bytes = build_xlsx_bytes(df, prev_df, out_prefix)   # ← sin cat_key
     xlsx_name  = f"{out_prefix}_snapshot_{stamp}.xlsx"
     pq_name    = f"{out_prefix}_snapshot_{stamp}.parquet"
 
