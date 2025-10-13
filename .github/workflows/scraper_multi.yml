@@ -1,9 +1,9 @@
-name: Palacio Scraper (A→B→C→D→E + Global)
+name: Palacio Scraper (A→B→C→D→E con histórico)
 
 on:
-  #schedule:
-    # 3:00 AM CDMX (≈09:00 UTC en invierno; ajusta si quieres)
-    #- cron: "0 9 * * *"
+  schedule:
+    # 3:00 AM (CDMX). Ajusta si lo necesitas.
+    - cron: "0 9 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
+      PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
@@ -21,22 +22,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Python 3.11
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Instalar deps
+        with: { python-version: "3.11" }
+      - name: Instalar dependencias
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow fastparquet
+          fi
       - name: Instalar rclone
         run: |
           sudo apt-get update
           sudo apt-get install -y rclone
-
       - name: Configurar rclone
         shell: bash
         env:
@@ -59,33 +61,26 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-
-      - name: Preparar carpeta y bajar histórico (.parquet)
+      - name: Preparar carpeta local y bajar histórico (.parquet)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
           rclone copy gdrive: "$SAVE_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
-
-      - name: Ejecutar grupo A
+          ls -lh "$SAVE_DIR" || true
+      - name: Ejecutar grupo A (–all)
         run: |
-          python palacio_group_a.py
-
-      - name: Subir resultados a Drive
+          python palacio_group_a.py --all
+      - name: Subir resultados (XLSX+PARQUET) a Drive
         run: |
           rclone copy "$SAVE_DIR" gdrive: --include "*.xlsx" --include "*.parquet" -v --retries 3 --transfers 4 --checkers 8
-
-      - name: Subir artefactos del grupo A (XLSX)
-        uses: actions/upload-artifact@v4
-        with:
-          name: group-a-xlsx
-          path: ${{ env.SAVE_DIR }}/*.xlsx
-          if-no-files-found: ignore
-          retention-days: 3
 
   group_b:
     runs-on: ubuntu-latest
     needs: group_a
     timeout-minutes: 360
     env:
+      PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
@@ -94,16 +89,25 @@ jobs:
       EMAIL_TO:    ${{ secrets.EMAIL_TO }}
       EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python 3.11
+        uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - name: Instalar deps
+      - name: Instalar dependencias
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow fastparquet
+          fi
       - name: Instalar rclone
         run: |
-          sudo apt-get update && sudo apt-get install -y rclone
+          sudo apt-get update
+          sudo apt-get install -y rclone
       - name: Configurar rclone
         shell: bash
         env:
@@ -126,30 +130,27 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-      - name: Preparar carpeta y bajar histórico
+      - name: Preparar carpeta local y bajar histórico (.parquet)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
           rclone copy gdrive: "$SAVE_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
-      - name: Ejecutar grupo B
-        run: python palacio_group_b.py
-      - name: Subir resultados a Drive
+          ls -lh "$SAVE_DIR" || true
+      - name: Ejecutar grupo B (–all)
+        run: |
+          python palacio_group_b.py --all
+      - name: Subir resultados (XLSX+PARQUET) a Drive
         run: |
           rclone copy "$SAVE_DIR" gdrive: --include "*.xlsx" --include "*.parquet" -v --retries 3 --transfers 4 --checkers 8
-      - name: Subir artefactos del grupo B (XLSX)
-        uses: actions/upload-artifact@v4
-        with:
-          name: group-b-xlsx
-          path: ${{ env.SAVE_DIR }}/*.xlsx
-          if-no-files-found: ignore
-          retention-days: 3
 
   group_c:
     runs-on: ubuntu-latest
     needs: group_b
     timeout-minutes: 360
     env:
+      PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
-      EMAIL_*_MASK: "unused"
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
       EMAIL_USER:  ${{ secrets.EMAIL_USER }}
@@ -157,16 +158,25 @@ jobs:
       EMAIL_TO:    ${{ secrets.EMAIL_TO }}
       EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python 3.11
+        uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - name: Instalar deps
+      - name: Instalar dependencias
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow fastparquet
+          fi
       - name: Instalar rclone
         run: |
-          sudo apt-get update && sudo apt-get install -y rclone
+          sudo apt-get update
+          sudo apt-get install -y rclone
       - name: Configurar rclone
         shell: bash
         env:
@@ -189,28 +199,26 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-      - name: Preparar carpeta y bajar histórico
+      - name: Preparar carpeta local y bajar histórico (.parquet)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
           rclone copy gdrive: "$SAVE_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
-      - name: Ejecutar grupo C
-        run: python palacio_group_c.py
-      - name: Subir resultados a Drive
+          ls -lh "$SAVE_DIR" || true
+      - name: Ejecutar grupo C (–all)
+        run: |
+          python palacio_group_c.py --all
+      - name: Subir resultados (XLSX+PARQUET) a Drive
         run: |
           rclone copy "$SAVE_DIR" gdrive: --include "*.xlsx" --include "*.parquet" -v --retries 3 --transfers 4 --checkers 8
-      - name: Subir artefactos del grupo C (XLSX)
-        uses: actions/upload-artifact@v4
-        with:
-          name: group-c-xlsx
-          path: ${{ env.SAVE_DIR }}/*.xlsx
-          if-no-files-found: ignore
-          retention-days: 3
 
   group_d:
     runs-on: ubuntu-latest
     needs: group_c
     timeout-minutes: 360
     env:
+      PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
@@ -219,16 +227,25 @@ jobs:
       EMAIL_TO:    ${{ secrets.EMAIL_TO }}
       EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python 3.11
+        uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - name: Instalar deps
+      - name: Instalar dependencias
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow fastparquet
+          fi
       - name: Instalar rclone
         run: |
-          sudo apt-get update && sudo apt-get install -y rclone
+          sudo apt-get update
+          sudo apt-get install -y rclone
       - name: Configurar rclone
         shell: bash
         env:
@@ -251,28 +268,26 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-      - name: Preparar carpeta y bajar histórico
+      - name: Preparar carpeta local y bajar histórico (.parquet)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
           rclone copy gdrive: "$SAVE_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
-      - name: Ejecutar grupo D
-        run: python palacio_group_d.py
-      - name: Subir resultados a Drive
+          ls -lh "$SAVE_DIR" || true
+      - name: Ejecutar grupo D (–all)
+        run: |
+          python palacio_group_d.py --all
+      - name: Subir resultados (XLSX+PARQUET) a Drive
         run: |
           rclone copy "$SAVE_DIR" gdrive: --include "*.xlsx" --include "*.parquet" -v --retries 3 --transfers 4 --checkers 8
-      - name: Subir artefactos del grupo D (XLSX)
-        uses: actions/upload-artifact@v4
-        with:
-          name: group-d-xlsx
-          path: ${{ env.SAVE_DIR }}/*.xlsx
-          if-no-files-found: ignore
-          retention-days: 3
 
   group_e:
     runs-on: ubuntu-latest
     needs: group_d
     timeout-minutes: 360
     env:
+      PYTHONUNBUFFERED: "1"
       SAVE_DIR: /tmp/palacio_out
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
@@ -281,16 +296,25 @@ jobs:
       EMAIL_TO:    ${{ secrets.EMAIL_TO }}
       EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python 3.11
+        uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - name: Instalar deps
+      - name: Instalar dependencias
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [[ -f requirements.txt ]]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pandas beautifulsoup4 xlsxwriter pyarrow fastparquet
+          fi
       - name: Instalar rclone
         run: |
-          sudo apt-get update && sudo apt-get install -y rclone
+          sudo apt-get update
+          sudo apt-get install -y rclone
       - name: Configurar rclone
         shell: bash
         env:
@@ -313,153 +337,16 @@ jobs:
               echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
             } > ~/.config/rclone/rclone.conf
           fi
-      - name: Preparar carpeta y bajar histórico
+      - name: Preparar carpeta local y bajar histórico (.parquet)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$SAVE_DIR"
           rclone copy gdrive: "$SAVE_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
-      - name: Ejecutar grupo E
-        run: python palacio_group_e.py
-      - name: Subir resultados a Drive
+          ls -lh "$SAVE_DIR" || true
+      - name: Ejecutar grupo E (–all)
+        run: |
+          python palacio_group_e.py --all
+      - name: Subir resultados (XLSX+PARQUET) a Drive
         run: |
           rclone copy "$SAVE_DIR" gdrive: --include "*.xlsx" --include "*.parquet" -v --retries 3 --transfers 4 --checkers 8
-      - name: Subir artefactos del grupo E (XLSX)
-        uses: actions/upload-artifact@v4
-        with:
-          name: group-e-xlsx
-          path: ${{ env.SAVE_DIR }}/*.xlsx
-          if-no-files-found: ignore
-          retention-days: 3
-
-  aggregate_global:
-    runs-on: ubuntu-latest
-    needs: [group_a, group_b, group_c, group_d, group_e]
-    timeout-minutes: 60
-    env:
-      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
-      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
-      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
-      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
-      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
-      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
-      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-    steps:
-      - name: Descargar artefactos (todos los XLSX de grupos)
-        uses: actions/download-artifact@v4
-        with:
-          pattern: group-*-xlsx
-          path: artifacts
-          merge-multiple: true
-
-      - name: Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Instalar deps para agregador
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas openpyxl xlsxwriter
-
-      - name: Construir Excel global y enviar correo
-        env:
-          EMAIL_HOST:  ${{ env.EMAIL_HOST }}
-          EMAIL_PORT:  ${{ env.EMAIL_PORT }}
-          EMAIL_USER:  ${{ env.EMAIL_USER }}
-          EMAIL_PASS:  ${{ env.EMAIL_PASS }}
-          EMAIL_TO:    ${{ env.EMAIL_TO }}
-          EMAIL_DEBUG: ${{ env.EMAIL_DEBUG }}
-        run: |
-          python - <<'PY'
-          import os, re, glob, io, smtplib
-          from email.message import EmailMessage
-          import pandas as pd
-          from datetime import datetime
-
-          def send_email(subject, body, to_addr, attachments=None):
-              host=os.environ.get("EMAIL_HOST","smtp.gmail.com")
-              port=int(os.environ.get("EMAIL_PORT","587"))
-              user=os.environ.get("EMAIL_USER","")
-              pwd =os.environ.get("EMAIL_PASS","")
-              to  =os.environ.get("EMAIL_TO","")
-              if not (user and pwd and to): 
-                  print("No EMAIL_* -> no envío")
-                  return
-              rec = [x.strip() for x in re.split(r"[;,]", to) if x.strip()]
-              msg=EmailMessage()
-              msg["From"]=user; msg["To"]=",".join(rec); msg["Subject"]=subject
-              msg.set_content(body)
-              for (name,data,mime) in (attachments or []):
-                  mt,st=(mime.split("/",1) if mime else ("application","octet-stream"))
-                  msg.add_attachment(data, maintype=mt, subtype=st, filename=name)
-              with smtplib.SMTP(host,port) as s:
-                  s.ehlo(); s.starttls(); s.ehlo(); s.login(user,pwd)
-                  s.send_message(msg, from_addr=user, to_addrs=rec)
-              print("Correo global enviado")
-
-          files = sorted(glob.glob("artifacts/*.xlsx"))
-          if not files:
-              print("No hay XLSX artefactados; nada que agregar.")
-              raise SystemExit(0)
-
-          def cat_from_fname(fn):
-              # ej: palacio_ofertas_snapshot_2025....xlsx -> ofertas
-              base=os.path.basename(fn)
-              m=re.match(r"palacio_([^_]+)_snapshot_", base)
-              return (m.group(1) if m else base)
-
-          new_all=[]; chg_all=[]; rem_all=[]
-          for f in files:
-              cat=cat_from_fname(f)
-              try:
-                  n = pd.read_excel(f, sheet_name="NEW")
-                  n.insert(0,"category",cat)
-                  new_all.append(n)
-              except Exception: pass
-              try:
-                  c = pd.read_excel(f, sheet_name="CHANGES")
-                  c.insert(0,"category",cat)
-                  chg_all.append(c)
-              except Exception: pass
-              try:
-                  r = pd.read_excel(f, sheet_name="REMOVED")
-                  r.insert(0,"category",cat)
-                  rem_all.append(r)
-              except Exception: pass
-
-          dfN = pd.concat(new_all, ignore_index=True) if new_all else pd.DataFrame({"info":["Sin NEW"]})
-          dfC = pd.concat(chg_all, ignore_index=True) if chg_all else pd.DataFrame({"info":["Sin CHANGES"]})
-          dfR = pd.concat(rem_all, ignore_index=True) if rem_all else pd.DataFrame({"info":["Sin REMOVED"]})
-
-          stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
-          out_name=f"palacio_aggregate_global_{stamp}.xlsx"
-          with pd.ExcelWriter(out_name, engine="xlsxwriter") as w:
-              dfN.to_excel(w, index=False, sheet_name="NEW_ALL")
-              dfC.to_excel(w, index=False, sheet_name="CHANGES_ALL")
-              dfR.to_excel(w, index=False, sheet_name="REMOVED_ALL")
-          data=open(out_name,"rb").read()
-
-          body=(f"Agregado global de la corrida:\n"
-                f"Archivos de grupos: {len(files)}\n"
-                f"NEW filas: {len(dfN)} | CHANGES filas: {len(dfC)} | REMOVED filas: {len(dfR)}")
-          send_email("[Scraper] Agregado GLOBAL", body, os.environ.get("EMAIL_TO",""),
-                     attachments=[(out_name, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")])
-          print("Listo:", out_name)
-          PY
-
-      - name: Subir agregado global a Drive
-        run: |
-          sudo apt-get update && sudo apt-get install -y rclone
-          mkdir -p ~/.config/rclone
-          if [ -n "${{ secrets.RCLONE_CONFIG }}" ]; then
-            printf '%s\n' "${{ secrets.RCLONE_CONFIG }}" > ~/.config/rclone/rclone.conf
-          else
-            printf '%s' "${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}" > sa.json
-            {
-              echo "[gdrive]"
-              echo "type = drive"
-              echo "scope = drive"
-              echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
-              echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
-            } > ~/.config/rclone/rclone.conf
-          fi
-          rclone copy . gdrive: --include "palacio_aggregate_global_*.xlsx" -v --retries 3
