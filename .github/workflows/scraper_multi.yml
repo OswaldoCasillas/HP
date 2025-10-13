@@ -1,9 +1,9 @@
 name: Palacio Scraper (A→B→C→D→E + Global)
 
 on:
-  schedule:
+  #schedule:
     # 3:00 AM CDMX (≈09:00 UTC en invierno; ajusta si quieres)
-    - cron: "0 9 * * *"
+    #- cron: "0 9 * * *"
   workflow_dispatch: {}
 
 jobs:
