@@ -1,0 +1,47 @@
+name: Scrape Adolfo Dominguez MX
+
+on:
+  schedule:
+    # Corre todos los días a las 20:00 UTC
+    # 20:00 UTC = 14:00 (2 PM) Ciudad de México si no hay DST raro.
+    # OJO: GitHub SIEMPRE usa UTC en cron.
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    # Te deja dispararlo manualmente desde la pestaña "Actions" 😎
+    # por si quieres probar sin esperar al cron.
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas beautifulsoup4 xlsxwriter openpyxl pyarrow
+
+      - name: Run scraper
+        env:
+          EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+          EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+          EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
+        run: |
+          python adolfodominguez_scraper.py --gender ambos --page-start 1 --max-pages 100 --alias ad_mx_search
+
+      - name: Upload artifact (snapshots)
+        uses: actions/upload-artifact@v4
+        with:
+          name: salidas_adolfodominguez
+          path: salidas_adolfodominguez/
+          retention-days: 7
