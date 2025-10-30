@@ -1,0 +1,21 @@
+stages:
+  - scrape
+
+scrape_adolfo:
+  stage: scrape
+  image: python:3.11-slim
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev build-essential
+    - pip install --no-cache-dir requests pandas beautifulsoup4 xlsxwriter openpyxl pyarrow
+  script:
+    # Ejecuta scraper con ambos géneros y envía correos
+    - python adolfodominguez_scraper.py --gender ambos --page-start 1 --max-pages 100 --alias ad_mx_search
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - salidas_adolfodominguez/
+  only:
+    - schedules
+    - main
+    - master
