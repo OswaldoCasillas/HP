@@ -84,8 +84,10 @@ def build_session() -> requests.Session:
     s.mount("http://", adapter); s.mount("https://", adapter)
     return s
 
-def fetch_page(session: requests.Session, base_url: str, start: int, page_size: int):
-    params = {"start": start, "sz": page_size}
+def fetch_page(session: requests.Session, base_url: str, start: int|None, page_size: int|None):
+    params = {}
+    if start is not None: params["start"] = start
+    if page_size is not None: params["sz"] = page_size
     time.sleep(random.uniform(0.05, 0.20))
     headers = random_headers()
     resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
@@ -93,11 +95,11 @@ def fetch_page(session: requests.Session, base_url: str, start: int, page_size: 
         try: wait_s = float(resp.headers["Retry-After"])
         except Exception: wait_s = 2.0
         print(f"⏳ 429 Retry-After {wait_s}s…"); time.sleep(wait_s)
-        resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        resp = session.get(base_url, params=params, headers=random_headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
     if resp.status_code in (520,522,523,524):
         print(f"↻ CF {resp.status_code} start={start}, sz={page_size}. Reintentando…")
         time.sleep(random.uniform(1.0, 2.5))
-        resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        resp = session.get(base_url, params=params, headers=random_headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
     resp.raise_for_status()
     return resp.text, resp.url
 
@@ -134,7 +136,8 @@ def nearest_b_product(node):
     for _ in range(8):
         if cur is None: break
         classes = cur.get("class") or []
-        if "b-product" in classes: return cur
+        if any(cls.startswith("b-product") for cls in classes):  # más laxo
+            return cur
         cur = cur.parent
     return node
 
@@ -161,7 +164,17 @@ def extract_from_analytics(bprod):
 
 def parse_products_from_html(html_text, page_url, page_start, page_idx, captured_at_iso):
     soup = BeautifulSoup(html_text, "html.parser")
-    tiles = soup.select("article.b-product_tile_item, div.b-product, li.product, div.product-tile")
+
+    # Selector ampliado (cubre layouts nuevos)
+    tiles = soup.select(
+        "article.b-product_tile_item, div.b-product_tile, div.b-product, "
+        "li.product, div.product-tile, article.product, li.grid-tile, "
+        "div.product-grid__item, [data-analytics]"
+    )
+    # Si aún nada, intenta subir desde elementos conocidos del snippet
+    if not tiles:
+        tiles = [el.parent for el in soup.select(".b-product_tile-name, .b-product_price") if el.parent]
+
     rows = []
     for t in tiles:
         bprod = nearest_b_product(t)
@@ -175,22 +188,23 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
         product_id = (meta_product_id or info.get("data-pid") or info.get("data-cnstrc-item-id") or info.get("product_id_analytics"))
         sku = meta_sku or product_id
 
+        # Nombre: soporta h3>a>h4 (como en tu snippet)
         meta_name = (bprod.select_one("meta[itemprop='name']")["content"].strip()
                      if bprod and bprod.select_one("meta[itemprop='name']") else None)
-        name = meta_name or info.get("data-cnstrc-item-name") or info.get("name_analytics")
-        if not name:
-            brand_vis = text_or_none(t.select_one(".b-product_tile-brand"))
-            title_el  = t.select_one(".b-product_tile-name, .b-product_tile-title a, .b-product_tile-title, a.b-product_tile-title-link")
-            title_vis = text_or_none(title_el)
-            name = " ".join(x for x in [brand_vis, title_vis] if x) or None
+        if not meta_name:
+            h4_in_a = bprod.select_one(".b-product_tile-name a h4")
+            name = text_or_none(h4_in_a) or text_or_none(bprod.select_one(".b-product_tile-name")) \
+                   or info.get("data-cnstrc-item-name") or info.get("name_analytics")
+        else:
+            name = meta_name
 
         brand = (bprod.get("data-brand") if bprod and bprod.get("data-brand") else None) \
                 or info.get("brand_analytics") \
-                or text_or_none(t.select_one(".b-product_tile-brand h4"))
+                or text_or_none(bprod.select_one(".b-product_tile-brand h4"))
         category   = info.get("category_analytics")
         department = info.get("department_analytics")
 
-        a = t.select_one("a[href]")
+        a = bprod.select_one("a[href]")
         enlace = urljoin(page_url, a["href"]) if a and a.has_attr("href") else None
 
         image_meta = bprod.select_one("meta[itemprop='image']") if bprod else None
@@ -203,9 +217,10 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
         price_currency = currency_meta or info.get("currency_analytics") or "MXN"
         availability   = availability_meta or info.get("availability_analytics")
 
-        list_span = t.select_one("div.b-product_price-old span.b-product_price-value")
-        sale_span = t.select_one("div.b-product_price-sales.m-reduced span.b-product_price-value") \
-                  or t.select_one("div.b-product_price-sales span.b-product_price-value")
+        list_span = bprod.select_one("div.b-product_price-old span.b-product_price-value")
+        sale_span = bprod.select_one("div.b-product_price-sales.m-reduced span.b-product_price-value") \
+                  or bprod.select_one("div.b-product_price-sales span.b-product_price-value")
+
         def _num(el):
             if not el: return None
             txt = el.get("content") or el.text
@@ -249,7 +264,6 @@ def _normalize_numeric(df: pd.DataFrame, cols=("list_price","sale_price","discou
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# Helper anti-duplicado de columna "category"
 def _ensure_category_col(df: pd.DataFrame, cat_key: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -262,7 +276,6 @@ def _ensure_category_col(df: pd.DataFrame, cat_key: str) -> pd.DataFrame:
 def _changes_merge(prev_df: pd.DataFrame, cur_df: pd.DataFrame):
     use_pid = (cur_df["product_id"].notna().sum() > 0) and (prev_df["product_id"].notna().sum() > 0)
     key = "product_id" if use_pid else "sku"
-
     merged = prev_df.merge(cur_df, on=key, suffixes=("_old","_new"), how="outer", indicator=True)
 
     def changed_num(a,b,atol=0.01):
@@ -287,13 +300,10 @@ def _changes_merge(prev_df: pd.DataFrame, cur_df: pd.DataFrame):
     if not removed_items.empty:
         keep_cols = [c for c in removed_items.columns if c.endswith("_old") or c == key]
         removed_items = removed_items[keep_cols].rename(columns=lambda c: c.replace("_old",""))
-
     return key, changes, new_items, removed_items
 
 def build_xlsx_bytes(df: pd.DataFrame, prev_df: pd.DataFrame|None, out_prefix: str, cat_key: str) -> bytes:
-    # Asegura columna category también en SNAPSHOT
     df = _ensure_category_col(df, cat_key)
-
     if prev_df is not None and not prev_df.empty and not df.empty:
         key, changes, new_items, removed_items = _changes_merge(prev_df, df)
     else:
@@ -301,7 +311,6 @@ def build_xlsx_bytes(df: pd.DataFrame, prev_df: pd.DataFrame|None, out_prefix: s
         new_items = df.copy()
         removed_items = pd.DataFrame(columns=df.columns)
 
-    # Asegura columna category en NEW/CHANGES/REMOVED
     new_items     = _ensure_category_col(new_items, cat_key)
     if "info" not in changes.columns:
         changes   = _ensure_category_col(changes, cat_key)
@@ -360,6 +369,10 @@ COLUMNS_EXPORT = ["product_id","sku","name","brand","category","department","pri
                   "list_price","sale_price","discount_pct","availability","image_url","enlace",
                   "page_start","page_idx","captured_at"]
 
+def looks_like_block(html_text: str) -> bool:
+    t = (html_text or "").lower()
+    return any(x in t for x in ["cf-error","cloudflare","captcha","acceso denegado"])
+
 def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     session = build_session()
     base_url  = args.url or cfg["base_url"]
@@ -373,6 +386,12 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     print(f"URL base: {base_url}")
     print(f"start={start}, sz={page_size}, step={page_step}, max_pages={max_pages}")
 
+    # Warm-up de cookies (algunos landings no devuelven grid en el primer request con params)
+    try:
+        session.get(base_url, headers=random_headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    except Exception:
+        pass
+
     all_rows, seen_ids = [], set()
     page_idx = 0
     empty_streak = 0
@@ -382,6 +401,10 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     while page_idx < max_pages:
         try:
             html_text, real_url, used_sz = _fetch_with_fallback(session, base_url, start, page_size)
+            if looks_like_block(html_text):
+                print("⚠️ Página parece muro/login/captcha. Reintentando…")
+                time.sleep(random.uniform(1.5, 3.0))
+                html_text, real_url, used_sz = _fetch_with_fallback(session, base_url, start, page_size)
         except Exception as e:
             print(f"⚠️ Error de red start={start}: {type(e).__name__}: {e}")
             empty_streak += 1
@@ -390,6 +413,21 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
             page_idx += 1; start += page_step; continue
 
         page_rows, tiles_count = parse_products_from_html(html_text, real_url, page_start=start, page_idx=page_idx, captured_at_iso=captured_at)
+
+        # Fallback extra si la primera página viene vacía
+        if page_idx == 0 and tiles_count == 0:
+            try:
+                print("↻ Fallback: GET sin parámetros…")
+                html0, url0 = fetch_page(session, base_url, start=None, page_size=None)
+                page_rows0, tiles0 = parse_products_from_html(html0, url0, page_start=0, page_idx=0, captured_at_iso=captured_at)
+                if tiles0 > 0:
+                    page_rows = page_rows0; tiles_count = tiles0
+                    print(f"   Recuperado sin params: tiles={tiles0}")
+            except Exception:
+                pass
+            if tiles_count == 0:
+                page_size = 80; page_step = 80
+                print("↘︎ Ajuste temporal: page_size=80, page_step=80")
 
         new_rows = []
         for r in page_rows:
@@ -473,18 +511,12 @@ def pick_category_interactively():
             return keys[idx-1]
     except Exception:
         pass
-    # Fallback seguro: primera del grupo actual
-    print(f"Opción inválida, usando '{keys[0]}'.")
-    return keys[0]
-
+    print(f"Opción inválida, usando '{keys[0]}'."); return keys[0]
 
 def main():
     args = parse_args()
-
-    # En CI, si no se especificó nada, forza --all
     if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) and not args.all and not args.category:
         args.all = True
-
     if args.all:
         print("▶ Ejecutando TODAS las categorías del grupo…")
         for idx, (cat_key, cfg) in enumerate(CATEGORIES.items(), start=1):
@@ -495,12 +527,13 @@ def main():
                 print(f"⏸️ Pausa entre categorías: {cat_pause:.2f}s…"); time.sleep(cat_pause)
         print("🎉 Terminaron todas.")
     else:
+        if not args.category:
+            args.category = pick_category_interactively()
         if args.category not in CATEGORIES:
             print(f"⚠️ La categoría '{args.category}' no pertenece a este grupo.")
             print("Válidas:", ", ".join(CATEGORIES.keys()))
             return
         run_single_category(args.category, CATEGORIES[args.category], args)
-
 
 if __name__ == "__main__":
     main()
