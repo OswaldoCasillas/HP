@@ -7,7 +7,7 @@ from email.message import EmailMessage
 
 import requests
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import smtplib
@@ -123,140 +123,184 @@ def _fetch_with_fallback(session, base_url, start, page_size):
 
 # ───────── Helpers parse ─────────
 _money_clean = re.compile(r"[^\d.,]")
+ID_FROM_URL = re.compile(r"-(\d{5,})\.html", re.I)
+
 def parse_price(txt):
     if not txt: return None
-    s = _money_clean.sub("", txt).strip().replace(",", "")
+    s = _money_clean.sub("", str(txt)).strip().replace(",", "")
     try: return float(s)
     except ValueError: return None
 
 def text_or_none(el): return el.get_text(" ", strip=True) if el else None
 
-def nearest_b_product(node):
+def nearest_b_product(node: Tag|None) -> Tag|None:
     cur = node
     for _ in range(8):
-        if cur is None: break
+        if not cur: break
         classes = cur.get("class") or []
-        if any(cls.startswith("b-product") for cls in classes):  # más laxo
+        if any(cls.startswith("b-product") for cls in classes):
             return cur
         cur = cur.parent
     return node
 
-# ⬇⬇⬇ CORREGIDO: ahora leemos list/sale de data-analytics y más metadatos
-def extract_from_analytics(bprod):
-    out = {}
-    if not bprod:
-        return out
-    da = bprod.get("data-analytics")
-    if da:
-        try:
-            data = json.loads(html.unescape(da))
-            prod = data.get("product", {}) if isinstance(data, dict) else {}
-            out["product_id_analytics"]   = str(prod.get("id")) if prod.get("id") is not None else None
-            out["name_analytics"]         = prod.get("name")
-            out["brand_analytics"]        = prod.get("brand")
-            out["category_analytics"]     = prod.get("category")
-            out["department_analytics"]   = prod.get("departmentName")
-            # IMPORTANTES en Palacio:
-            out["sale_price_analytics"]   = prod.get("price")   # oferta
-            out["list_price_analytics"]   = prod.get("metric1") # lista
-            out["currency_analytics"]     = prod.get("priceCurrency") or "MXN"
-            out["availability_analytics"] = prod.get("availability")
-        except Exception:
-            pass
-    for k in ["data-pid","data-cnstrc-item-id","data-cnstrc-item-name"]:
-        if bprod.get(k): out[k] = bprod.get(k)
-    return out
-
-# ⬇⬇⬇ NUEVO: localiza el bloque schema.org del producto por productID
 def find_schema_product_container(soup: BeautifulSoup, product_id: str|None):
     if not soup or not product_id:
         return None
     meta = soup.select_one(f"meta[itemprop='productID'][content='{product_id}']")
     if not meta:
         meta = soup.select_one(f"meta[itemprop='sku'][content='{product_id}']")
-    if not meta:
-        return None
-    return meta.find_parent(attrs={"itemscope": True})
+    return meta.find_parent(attrs={"itemscope": True}) if meta else None
 
-# ⬇⬇⬇ CORREGIDO: añade fallbacks a analytics y schema.org
+def extract_from_analytics_node(node: Tag|None) -> dict:
+    out = {}
+    if not node: return out
+    da = node.get("data-analytics")
+    if da:
+        try:
+            data = json.loads(html.unescape(da))
+            prod = data.get("product", {}) if isinstance(data, dict) else {}
+            out["product_id"]   = str(prod.get("id")) if prod.get("id") is not None else None
+            out["name"]         = prod.get("name")
+            out["brand"]        = prod.get("brand")
+            out["category"]     = prod.get("category")
+            out["department"]   = prod.get("departmentName")
+            out["sale_price"]   = prod.get("price")
+            out["list_price"]   = prod.get("metric1")
+            out["currency"]     = prod.get("priceCurrency") or "MXN"
+            out["availability"] = prod.get("availability")
+        except Exception:
+            pass
+    # otros hints
+    for k in ["data-pid","data-cnstrc-item-id","data-cnstrc-item-name","data-cnstrc-item-price"]:
+        if node.get(k): out[k] = node.get(k)
+    return out
+
+def find_neighbor_analytics(tile: Tag|None) -> dict:
+    """El data-analytics está en un DIV .b-product hermano/siguiente del tile en tu HTML."""
+    if not tile: return {}
+    # 1) dentro del tile
+    cand = tile.find(attrs={"data-analytics": True})
+    if cand: 
+        return extract_from_analytics_node(cand if isinstance(cand, Tag) else tile)
+
+    # 2) subir al contenedor de la tarjeta
+    base = nearest_b_product(tile)
+
+    # 3) hermanos siguientes inmediatos (hasta 6 saltos por seguridad)
+    cur = base
+    steps = 0
+    while cur and steps < 6:
+        cur = cur.next_sibling if cur else None
+        if isinstance(cur, Tag) and cur.has_attr("data-analytics"):
+            return extract_from_analytics_node(cur)
+        if isinstance(cur, Tag) and ("b-product" in (cur.get("class") or [])) and cur.has_attr("data-analytics"):
+            return extract_from_analytics_node(cur)
+        steps += 1
+    # 4) fallback: buscar el primer .b-product[data-analytics] más cercano hacia adelante
+    nxt = base.find_next(lambda t: isinstance(t, Tag) and t.has_attr("data-analytics") and ("b-product" in (t.get("class") or [])))
+    if nxt:
+        return extract_from_analytics_node(nxt)
+    return {}
+
+def extract_prices_from_tile(tile: Tag|None):
+    """Intenta precios del DOM del tile."""
+    if not tile: return (None, None)
+    list_span = tile.select_one("div.b-product_price-old span.b-product_price-value")
+    sale_span = (tile.select_one("div.b-product_price-sales.m-reduced span.b-product_price-value")
+                 or tile.select_one("div.b-product_price-sales span.b-product_price-value"))
+    def _num(el):
+        if not el: return None
+        txt = el.get("content") or el.text
+        return parse_price(txt)
+    return _num(list_span), _num(sale_span)
+
+def extract_link_and_image(tile: Tag|None, page_url: str):
+    enlace = None
+    img = None
+    if tile:
+        a = tile.select_one("a[href]") or tile.select_one(".b-product_tile-name a[href]")
+        if a and a.has_attr("href"):
+            enlace = urljoin(page_url, a["href"])
+        pic = tile.select_one("img[src]") or tile.select_one("meta[itemprop='image']")
+        if pic:
+            if pic.name == "img":
+                img = pic.get("src") or pic.get("data-src")
+            elif pic.name == "meta":
+                img = pic.get("content")
+    return enlace, img
+
+# ───────── PARSER principal ─────────
 def parse_products_from_html(html_text, page_url, page_start, page_idx, captured_at_iso):
     soup = BeautifulSoup(html_text, "html.parser")
 
-    # Selector ampliado (cubre layouts nuevos)
+    # tiles: usa el componente de PLP y formas equivalentes
     tiles = soup.select(
-        "article.b-product_tile_item, div.b-product_tile, div.b-product, "
+        "div.b-product_tile[data-component='search/ProductTile'], "
+        "article.b-product_tile_item, "
+        "div.b-product_tile, "
         "li.product, div.product-tile, article.product, li.grid-tile, "
-        "div.product-grid__item, [data-analytics]"
+        "div.product-grid__item"
     )
-    # Si aún nada, intenta subir desde elementos conocidos del snippet
+    # fallback si no detectó
     if not tiles:
-        tiles = [el.parent for el in soup.select(".b-product_tile-name, .b-product_price") if el.parent]
+        tiles = [el.parent for el in soup.select(".b-product_tile-name, .b-product_price") if isinstance(el.parent, Tag)]
 
     rows = []
+    seen_enlaces = set()
+
     for t in tiles:
-        bprod = nearest_b_product(t)
-        info = extract_from_analytics(bprod)
+        tile = nearest_b_product(t)
 
-        meta_product_id = (bprod.select_one("meta[itemprop='productID']")["content"].strip()
-                           if bprod and bprod.select_one("meta[itemprop='productID']") else None)
-        meta_sku = (bprod.select_one("meta[itemprop='sku']")["content"].strip()
-                    if bprod and bprod.select_one("meta[itemprop='sku']") else None)
+        # Enlace e imagen primero (nos sirve para ID por URL)
+        enlace, image_url = extract_link_and_image(tile, page_url)
 
-        product_id = (meta_product_id or info.get("data-pid") or info.get("data-cnstrc-item-id") or info.get("product_id_analytics"))
-        sku = meta_sku or product_id
+        # ID por URL (fallback vital en Palacio)
+        url_id = None
+        if isinstance(enlace, str):
+            m = ID_FROM_URL.search(enlace)
+            if m: url_id = m.group(1)
 
-        # Nombre: soporta h3>a>h4 (como en tu snippet)
-        meta_name = (bprod.select_one("meta[itemprop='name']")["content"].strip()
-                     if bprod and bprod.select_one("meta[itemprop='name']") else None)
-        if not meta_name:
-            h4_in_a = bprod.select_one(".b-product_tile-name a h4")
-            name = text_or_none(h4_in_a) or text_or_none(bprod.select_one(".b-product_tile-name")) \
-                   or info.get("data-cnstrc-item-name") or info.get("name_analytics")
-        else:
-            name = meta_name
+        # Analytics cercano (puede estar fuera del tile)
+        ana = find_neighbor_analytics(tile)
 
-        brand = (bprod.get("data-brand") if bprod and bprod.get("data-brand") else None) \
-                or info.get("brand_analytics") \
-                or text_or_none(bprod.select_one(".b-product_tile-brand h4"))
-        category   = info.get("category_analytics")
-        department = info.get("department_analytics")
+        # IDs
+        meta_pid = tile.select_one("meta[itemprop='productID']")
+        meta_sku = tile.select_one("meta[itemprop='sku']")
+        product_id = (meta_pid.get("content").strip() if meta_pid and meta_pid.get("content") else None) \
+                     or ana.get("product_id") \
+                     or ana.get("data-pid") \
+                     or ana.get("data-cnstrc-item-id") \
+                     or url_id
+        sku = (meta_sku.get("content").strip() if meta_sku and meta_sku.get("content") else None) or product_id
 
-        a = bprod.select_one("a[href]")
-        enlace = urljoin(page_url, a["href"]) if a and a.has_attr("href") else None
+        # Nombre / Marca
+        h4_in_a = tile.select_one(".b-product_tile-name a h4")
+        name_dom = text_or_none(h4_in_a) or text_or_none(tile.select_one(".b-product_tile-name")) \
+                   or (tile.select_one("meta[itemprop='name']").get("content").strip()
+                       if tile.select_one("meta[itemprop='name']") else None)
+        name = name_dom or ana.get("data-cnstrc-item-name") or ana.get("name")
 
-        image_meta = bprod.select_one("meta[itemprop='image']") if bprod else None
-        image_url = image_meta["content"].strip() if image_meta and image_meta.get("content") else None
+        brand_dom = text_or_none(tile.select_one(".b-product_tile-brand h4")) \
+                    or (tile.get("data-brand") if tile.get("data-brand") else None)
+        brand = brand_dom or ana.get("brand")
 
-        currency_meta = (bprod.select_one("meta[itemprop='priceCurrency']")["content"].strip()
-                         if bprod and bprod.select_one("meta[itemprop='priceCurrency']") else None)
-        availability_meta = (bprod.select_one("meta[itemprop='availability']")["content"].strip()
-                             if bprod and bprod.select_one("meta[itemprop='availability']") else None)
-        price_currency = currency_meta or info.get("currency_analytics") or "MXN"
-        availability   = availability_meta or info.get("availability_analytics")
+        # Moneda / disponibilidad preliminar
+        currency_meta = (tile.select_one("meta[itemprop='priceCurrency']").get("content").strip()
+                         if tile.select_one("meta[itemprop='priceCurrency']") else None)
+        price_currency = currency_meta or ana.get("currency") or "MXN"
+        availability = (tile.select_one("meta[itemprop='availability']").get("content").strip()
+                        if tile.select_one("meta[itemprop='availability']") else None) or ana.get("availability")
 
-        # --- PRECIOS: DOM → analytics → schema.org (por productID) ---
-        list_span = bprod.select_one("div.b-product_price-old span.b-product_price-value")
-        sale_span = bprod.select_one("div.b-product_price-sales.m-reduced span.b-product_price-value") \
-                  or bprod.select_one("div.b-product_price-sales span.b-product_price-value")
+        # Precios DOM
+        list_price, sale_price = extract_prices_from_tile(tile)
 
-        def _num(el):
-            if not el: return None
-            txt = el.get("content") or el.text
-            return parse_price(txt) if txt else None
-        list_price = _num(list_span)
-        sale_price = _num(sale_span)
-
-        # Fallback a data-analytics
+        # Fallback a analytics
         if list_price is None:
-            lp_ana = info.get("list_price_analytics")
-            try: list_price = float(lp_ana) if lp_ana is not None else None
-            except Exception: pass
+            list_price = parse_price(ana.get("list_price"))
         if sale_price is None:
-            sp_ana = info.get("sale_price_analytics")
-            try: sale_price = float(sp_ana) if sp_ana is not None else None
-            except Exception: pass
+            sale_price = parse_price(ana.get("sale_price") or ana.get("data-cnstrc-item-price"))
 
-        # Fallback a schema.org (vía productID)
+        # Fallback a schema.org (por product_id)
         if (list_price is None or sale_price is None) and product_id:
             container = find_schema_product_container(soup, str(product_id))
             if container:
@@ -269,23 +313,29 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
                     list_price = parse_price(high_meta.get("content"))
                 if cur_meta and cur_meta.get("content") and not currency_meta:
                     price_currency = cur_meta.get("content").strip() or price_currency
-                # Completar nombre/marca/imagen si faltan
                 if not name:
                     nm = container.select_one("meta[itemprop='name']")
-                    if nm and nm.get("content"):
-                        name = nm.get("content").strip()
+                    if nm and nm.get("content"): name = nm.get("content").strip()
                 if not brand:
                     bm = container.select_one("meta[itemprop='brand']")
-                    if bm and bm.get("content"):
-                        brand = bm.get("content").strip()
+                    if bm and bm.get("content"): brand = bm.get("content").strip()
                 if not image_url:
                     im = container.select_one("meta[itemprop='image']")
-                    if im and im.get("content"):
-                        image_url = im.get("content").strip()
+                    if im and im.get("content"): image_url = im.get("content").strip()
 
+        # Últimos retoques
+        category   = ana.get("category")
+        department = ana.get("department")
+
+        # Descuento
         discount_pct = None
         if list_price is not None and sale_price is not None and sale_price < list_price:
-            discount_pct = round((1 - sale_price / list_price) * 100, 2)
+            discount_pct = round((1 - (sale_price / list_price)) * 100, 2)
+
+        # dedupe por enlace (PLP suele repetir tile/analytics)
+        if enlace and enlace in seen_enlaces:
+            continue
+        if enlace: seen_enlaces.add(enlace)
 
         rows.append({
             "product_id": str(product_id) if product_id is not None else None,
@@ -447,7 +497,7 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     except Exception:
         pass
 
-    all_rows, seen_ids = [], set()
+    all_rows, seen_keys = [], set()
     page_idx = 0
     empty_streak = 0
     next_long_pause_at = random.randint(*LONG_PAUSE_EVERY)
@@ -484,11 +534,13 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
                 page_size = 80; page_step = 80
                 print("↘︎ Ajuste temporal: page_size=80, page_step=80")
 
+        # De-dupe por product_id o enlace
         new_rows = []
         for r in page_rows:
-            key = r.get("product_id") or r.get("enlace")
-            if key and key not in seen_ids:
-                seen_ids.add(key); new_rows.append(r)
+            key = (r.get("product_id") or "") + "|" + (r.get("enlace") or "")
+            if key and key not in seen_keys:
+                seen_keys.add(key)
+                new_rows.append(r)
 
         print(f"Página {page_idx} (start={start}, sz={used_sz}): tiles={tiles_count}, nuevos={len(new_rows)}")
 
