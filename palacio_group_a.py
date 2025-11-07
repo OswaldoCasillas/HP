@@ -141,27 +141,44 @@ def nearest_b_product(node):
         cur = cur.parent
     return node
 
+# ⬇⬇⬇ CORREGIDO: ahora leemos list/sale de data-analytics y más metadatos
 def extract_from_analytics(bprod):
     out = {}
-    if not bprod: return out
+    if not bprod:
+        return out
     da = bprod.get("data-analytics")
     if da:
         try:
             data = json.loads(html.unescape(da))
             prod = data.get("product", {}) if isinstance(data, dict) else {}
-            out["product_id_analytics"] = str(prod.get("id")) if prod.get("id") is not None else None
-            out["name_analytics"]       = prod.get("name")
-            out["brand_analytics"]      = prod.get("brand")
-            out["category_analytics"]   = prod.get("category")
-            out["department_analytics"] = prod.get("departmentName")
-            out["price_analytics"]      = prod.get("price")
-            out["currency_analytics"]   = prod.get("priceCurrency") or "MXN"
-            out["availability_analytics"]= prod.get("availability")
-        except Exception: pass
+            out["product_id_analytics"]   = str(prod.get("id")) if prod.get("id") is not None else None
+            out["name_analytics"]         = prod.get("name")
+            out["brand_analytics"]        = prod.get("brand")
+            out["category_analytics"]     = prod.get("category")
+            out["department_analytics"]   = prod.get("departmentName")
+            # IMPORTANTES en Palacio:
+            out["sale_price_analytics"]   = prod.get("price")   # oferta
+            out["list_price_analytics"]   = prod.get("metric1") # lista
+            out["currency_analytics"]     = prod.get("priceCurrency") or "MXN"
+            out["availability_analytics"] = prod.get("availability")
+        except Exception:
+            pass
     for k in ["data-pid","data-cnstrc-item-id","data-cnstrc-item-name"]:
         if bprod.get(k): out[k] = bprod.get(k)
     return out
 
+# ⬇⬇⬇ NUEVO: localiza el bloque schema.org del producto por productID
+def find_schema_product_container(soup: BeautifulSoup, product_id: str|None):
+    if not soup or not product_id:
+        return None
+    meta = soup.select_one(f"meta[itemprop='productID'][content='{product_id}']")
+    if not meta:
+        meta = soup.select_one(f"meta[itemprop='sku'][content='{product_id}']")
+    if not meta:
+        return None
+    return meta.find_parent(attrs={"itemscope": True})
+
+# ⬇⬇⬇ CORREGIDO: añade fallbacks a analytics y schema.org
 def parse_products_from_html(html_text, page_url, page_start, page_idx, captured_at_iso):
     soup = BeautifulSoup(html_text, "html.parser")
 
@@ -217,6 +234,7 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
         price_currency = currency_meta or info.get("currency_analytics") or "MXN"
         availability   = availability_meta or info.get("availability_analytics")
 
+        # --- PRECIOS: DOM → analytics → schema.org (por productID) ---
         list_span = bprod.select_one("div.b-product_price-old span.b-product_price-value")
         sale_span = bprod.select_one("div.b-product_price-sales.m-reduced span.b-product_price-value") \
                   or bprod.select_one("div.b-product_price-sales span.b-product_price-value")
@@ -227,6 +245,43 @@ def parse_products_from_html(html_text, page_url, page_start, page_idx, captured
             return parse_price(txt) if txt else None
         list_price = _num(list_span)
         sale_price = _num(sale_span)
+
+        # Fallback a data-analytics
+        if list_price is None:
+            lp_ana = info.get("list_price_analytics")
+            try: list_price = float(lp_ana) if lp_ana is not None else None
+            except Exception: pass
+        if sale_price is None:
+            sp_ana = info.get("sale_price_analytics")
+            try: sale_price = float(sp_ana) if sp_ana is not None else None
+            except Exception: pass
+
+        # Fallback a schema.org (vía productID)
+        if (list_price is None or sale_price is None) and product_id:
+            container = find_schema_product_container(soup, str(product_id))
+            if container:
+                low_meta  = container.select_one("meta[itemprop='lowPrice']")
+                high_meta = container.select_one("meta[itemprop='highPrice']")
+                cur_meta  = container.select_one("meta[itemprop='priceCurrency']")
+                if sale_price is None and low_meta and low_meta.get("content"):
+                    sale_price = parse_price(low_meta.get("content"))
+                if list_price is None and high_meta and high_meta.get("content"):
+                    list_price = parse_price(high_meta.get("content"))
+                if cur_meta and cur_meta.get("content") and not currency_meta:
+                    price_currency = cur_meta.get("content").strip() or price_currency
+                # Completar nombre/marca/imagen si faltan
+                if not name:
+                    nm = container.select_one("meta[itemprop='name']")
+                    if nm and nm.get("content"):
+                        name = nm.get("content").strip()
+                if not brand:
+                    bm = container.select_one("meta[itemprop='brand']")
+                    if bm and bm.get("content"):
+                        brand = bm.get("content").strip()
+                if not image_url:
+                    im = container.select_one("meta[itemprop='image']")
+                    if im and im.get("content"):
+                        image_url = im.get("content").strip()
 
         discount_pct = None
         if list_price is not None and sale_price is not None and sale_price < list_price:
@@ -386,7 +441,7 @@ def run_single_category(cat_key: str, cfg: dict, args: argparse.Namespace):
     print(f"URL base: {base_url}")
     print(f"start={start}, sz={page_size}, step={page_step}, max_pages={max_pages}")
 
-    # Warm-up de cookies (algunos landings no devuelven grid en el primer request con params)
+    # Warm-up de cookies
     try:
         session.get(base_url, headers=random_headers(), timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
     except Exception:
