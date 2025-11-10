@@ -1,320 +1,527 @@
-# ===================== PATCH PALACIO GROUP A — COMPLETO =====================
-# Imports
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Scraper de categorías de El Palacio de Hierro (grupo A) con:
+- Reintentos y User-Agent rotatorio para reducir 403
+- Export a Parquet + Excel
+- Envío de correo con adjunto por SMTP (credenciales por variables de entorno)
+- CLI con --all o --cat para ejecutar categorías específicas
+
+Requisitos (pip):
+  pip install requests beautifulsoup4 lxml pandas openpyxl python-dotenv
+
+Variables de entorno SMTP (ejemplos con Gmail/GSuite):
+  SMTP_HOST=smtp.gmail.com
+  SMTP_PORT=587
+  SMTP_USER=tu_usuario@dominio.com
+  SMTP_PASS=tu_password_ou_app_password
+  SMTP_FROM=tu_usuario@dominio.com
+  SMTP_TO=correo1@dom.com,correo2@dom.com
+"""
+
 from __future__ import annotations
-import os, time, random
+import os
+import re
+import io
+import ssl
+import sys
+import time
+import smtplib
+import random
+import logging
+import argparse
+from email.message import EmailMessage
 from datetime import datetime, timezone
-from typing import Tuple, Optional, List, Dict, Set
+from typing import Dict, List, Tuple, Optional
+from urllib.parse import urljoin, urlencode
 
-import pandas as pd
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 
-# ===================== Config/Constantes (ajusta si ya existen) =============
-CONNECT_TIMEOUT = 15
-READ_TIMEOUT = 45
-JITTER_MIN, JITTER_MAX = 0.35, 0.9
+# =========================
+# Configuración y utilidades
+# =========================
 
-# Carpeta de salida (usa la tuya si ya tienes otra)
-SAVE_DIR = "/tmp/palacio_out"
-os.makedirs(SAVE_DIR, exist_ok=True)
-
-# Destinatarios de correo (usa tu lista existente si ya la tienes)
-EMAIL_TO_LIST = os.environ.get("SCRAPER_EMAIL_TO", "***@tu-dominio.com").split(",")
-
-# Corta paginación tras N páginas seguidas sin productos
-STOP_AFTER_EMPTY = 2  # (antes estaba en 1; subimos a 2 para tolerar PLPs con huecos)
-
-# ===================== User-Agents ==========================================
-UA_LIST = [
-    # Desktop comunes
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
 ]
-# ➕ añadimos móviles (ayudan contra algunos WAF)
-UA_LIST.extend([
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-])
 
-def random_headers() -> Dict[str, str]:
-    ua = random.choice(UA_LIST)
-    return {
-        "user-agent": ua,
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "accept-language": "es-MX,es;q=0.9,en;q=0.8",
-        "cache-control": "no-cache",
-        "pragma": "no-cache",
-    }
+HEADERS_BASE = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "es-MX,es;q=0.9,en;q=0.8",
+    "cache-control": "no-cache",
+    "pragma": "no-cache",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "same-origin",
+    "upgrade-insecure-requests": "1",
+}
 
-# ===================== Email (usa el tuyo si ya tienes) ======================
-def send_email(subject: str, body: str, to_list: List[str], attachments: Optional[List[str]] = None):
-    """
-    Implementación de correo existente en tu proyecto.
-    Aquí sólo se deja la firma; si ya tienes una, ignora esta.
-    """
+SESSION = requests.Session()
+SESSION.verify = True
+
+
+def tz_now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+def ts_for_filename(prefix: str = "2025") -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def safe_int(s: str, default: int = 0) -> int:
     try:
-        # deja el hook a tu imple; aquí sólo logeamos para no romper
-        print(f"📧 [EMAIL] {subject}\n{body}\nAdjuntos: {attachments or '—'}")
-    except Exception as e:
-        print(f"⚠️ send_email falló: {e}")
+        return int(s)
+    except Exception:
+        return default
 
-# ===================== Helpers anti-403 / paginación =========================
-def fetch_html(session: requests.Session, url: str) -> Tuple[str, str]:
+
+def sleep_jitter(base: float = 0.7, spread: float = 0.6) -> None:
+    time.sleep(max(0.05, base + random.uniform(-spread, spread)))
+
+
+def log_setup(verbosity: int = 1):
+    level = logging.INFO if verbosity <= 1 else logging.DEBUG
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+# =========================
+# Scraping
+# =========================
+
+def fetch_url(url: str, max_retries: int = 4, timeout: int = 20) -> Optional[str]:
     """
-    GET “humano” con headers realistas y referer básico. Devuelve (html, final_url).
+    Descarga HTML con reintentos, rotando User-Agent y con backoff.
+    Devuelve texto HTML o None si falla.
     """
-    h = random_headers()
-    h.update({
-        "upgrade-insecure-requests": "1",
-        "sec-fetch-site": "same-origin",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-dest": "document",
-        "referer": url.split("?")[0],
-    })
-    resp = session.get(url, headers=h, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-    resp.raise_for_status()
-    return resp.text, resp.url
+    for attempt in range(1, max_retries + 1):
+        headers = dict(HEADERS_BASE)
+        headers["user-agent"] = random.choice(USER_AGENTS)
+        if "elpalaciodehierro.com" in url:
+            headers["referer"] = "https://www.elpalaciodehierro.com/"
 
-def extract_next_page_url(soup: BeautifulSoup, current_url: str) -> Optional[str]:
-    """
-    Detecta enlace de siguiente página en la PLP.
-    Soporta <link rel="next">, <a rel="next"> y varios selectores/textos comunes.
-    """
-    if not soup:
-        return None
+        try:
+            resp = SESSION.get(url, headers=headers, timeout=timeout)
+            status = resp.status_code
+            if status == 200 and resp.text:
+                return resp.text
 
-    # 1) rel=next
-    a = soup.select_one("link[rel='next'], a[rel='next']")
-    if a and a.get("href"):
-        return urljoin(current_url, a["href"])
+            if status in (403, 429):
+                wait = (2 ** attempt) + random.uniform(0.2, 0.9)
+                logging.warning(f"HTTP {status} en intento {attempt}/{max_retries} -> backoff {wait:.1f}s")
+                time.sleep(wait)
+                continue
 
-    # 2) selectores frecuentes
-    candidates = [
-        "a.b-pagination_next[href]",
-        "a.pagination__next[href]",
-        "a.next[href]",
-        "a.pager-next[href]",
-        "a.b-load_more[href]",
-        "button[data-url]",
-    ]
-    for sel in candidates:
-        el = soup.select_one(sel)
-        if el:
-            href = el.get("href") or el.get("data-url")
-            if href:
-                return urljoin(current_url, href)
+            if 500 <= status < 600:
+                wait = (1.5 ** attempt) + random.uniform(0.1, 0.6)
+                logging.warning(f"HTTP {status} en intento {attempt}/{max_retries} -> backoff {wait:.1f}s")
+                time.sleep(wait)
+                continue
 
-    # 3) por texto
-    for lab in ("Siguiente", "Next", "Ver más", "Load more"):
-        el = soup.find(lambda tag: tag.name in ("a", "button")
-                                 and lab.lower() in tag.get_text(" ", strip=True).lower())
-        if el:
-            href = el.get("href") or el.get("data-url")
-            if href:
-                return urljoin(current_url, href)
+            logging.error(f"HTTP {status} inesperado para {url}")
+            return None
+
+        except requests.RequestException as e:
+            wait = (1.7 ** attempt) + random.uniform(0.1, 0.8)
+            logging.warning(f"Error de red '{e}' intento {attempt}/{max_retries} -> {wait:.1f}s")
+            time.sleep(wait)
+
+    logging.error(f"Max reintentos alcanzado para {url}")
     return None
 
-# ===================== Fetch con fallback (start/sz) =========================
-def _fetch_with_fallback(session: requests.Session, base_url: str, start: int, page_size: int) -> Tuple[str, str, int]:
+
+def build_list_url(base: str, start: int, sz: int) -> str:
+    params = {"start": start, "sz": sz}
+    return f"{base}?{urlencode(params)}"
+
+
+def parse_listing(html: str, base_url: str) -> List[Dict]:
     """
-    Intenta GET con params ?start=&sz=. Si 403, cambia UA/Referer y reintenta 1 vez.
-    Devuelve (html, final_url, used_sz).
+    Parser conservador: intenta detectar tarjetas de producto comunes.
+    Si no logra parsear, devuelve lista vacía (no truena).
     """
-    params = {"start": start, "sz": page_size}
-    headers = random_headers()
-    resp = session.get(base_url, params=params, headers=headers, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    out: List[Dict] = []
+    soup = BeautifulSoup(html, "lxml")
 
-    # ▶ retry específico 403
-    if resp.status_code == 403:
-        headers2 = random_headers()
-        headers2["referer"] = base_url
-        time.sleep(random.uniform(0.6, 1.1))
-        resp = session.get(base_url, params=params, headers=headers2, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    candidates = [
+        ("article", {"class": re.compile(r"product.*card|grid-tile|product-tile", re.I)}),
+        ("div", {"class": re.compile(r"product.*card|grid-tile|product-tile", re.I)}),
+        ("li", {"class": re.compile(r"product.*card|grid-tile|product-tile", re.I)}),
+    ]
 
-    resp.raise_for_status()
-    html_text = resp.text
-    real_url = resp.url
-    used_sz = page_size
-
-    # si el sitio capó el tamaño, puedes detectar y ajustar used_sz aquí si fuera necesario
-    return html_text, real_url, used_sz
-
-# ===================== Parser (se asume existente en tu proyecto) ============
-# Debes tener ya algo como:
-# def parse_products_from_html(html_text: str, page_url: str, page_start: Optional[int], page_idx: int, captured_at_iso: str) -> Tuple[List[Dict], int]:
-#     ...
-# Debe devolver (rows:list[dict], tiles_count:int)
-
-# ===================== Runner de categoría (REEMPLAZO TOTAL) =================
-def run_single_category(cat_key: str,
-                        base_url: str,
-                        out_prefix: str,
-                        session: requests.Session,
-                        start: int = 0,
-                        page_size: int = 200,
-                        step: int = 200,
-                        max_pages: int = 200,
-                        stop_after_empty: Optional[int] = None,
-                        historical: bool = True) -> Dict:
-    """
-    Estrategia:
-      1) Cargar primera PLP SIN parámetros (evita WAF por querystring).
-      2) Si no hay tiles, intentar ?start=&sz= con retry 403.
-      3) Paginar preferentemente por enlace real "siguiente".
-      4) Si termina con 0 filas y hubo 403, mandar correo de ERROR 403 (sin adjuntos).
-    """
-    if stop_after_empty is None:
-        stop_after_empty = globals().get("STOP_AFTER_EMPTY", 2)
-
-    captured_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-    all_rows: List[Dict] = []
-    seen_keys: Set[str] = set()
-    blocked_403: bool = False
-
-    def add_rows(rows: List[Dict]) -> int:
-        new_rows = 0
-        for r in rows:
-            key = (r.get("product_id") or "") + "|" + (r.get("enlace") or "")
-            if key and key not in seen_keys:
-                seen_keys.add(key)
-                all_rows.append(r)
-                new_rows += 1
-        return new_rows
-
-    # 1) Primera página sin params
-    soup0 = None
-    next_url = None
-    first_tiles = 0
-    try:
-        html0, url0 = fetch_html(session, base_url)
-        soup0 = BeautifulSoup(html0, "html.parser")
-        first_rows, first_tiles = parse_products_from_html(
-            html0, url0, page_start=0, page_idx=0, captured_at_iso=captured_at
-        )
-        got = add_rows(first_rows)
-        print(f"Página 0 (sin params): tiles={first_tiles}, nuevos={got}")
-        next_url = extract_next_page_url(soup0, url0)
-    except requests.HTTPError as e:
-        if getattr(e, "response", None) is not None and e.response.status_code == 403:
-            blocked_403 = True
-            print(f"⛔️ 403 primer GET sin params: {base_url}")
-        else:
-            print(f"⚠️ Primer GET sin params falló: {type(e).__name__}: {e}")
-    except Exception as e:
-        print(f"⚠️ Primer GET sin params falló: {type(e).__name__}: {e}")
-
-    # 2) Si no hay tiles, intentar con start/sz
-    if first_tiles == 0:
-        print("↘︎ Sin tiles en primera página; probando ?start=&sz=…")
-        try:
-            html1, url1, used_sz = _fetch_with_fallback(session, base_url, start, page_size)
-            page_rows, tiles_count = parse_products_from_html(
-                html1, url1, page_start=start, page_idx=0, captured_at_iso=captured_at
-            )
-            got = add_rows(page_rows)
-            print(f"Página 0 (start/sz={used_sz}): tiles={tiles_count}, nuevos={got}")
-            soup0 = BeautifulSoup(html1, "html.parser")
-            next_url = extract_next_page_url(soup0, url1)
-        except requests.HTTPError as e:
-            sc = getattr(e.response, "status_code", None)
-            if sc == 403:
-                blocked_403 = True
-                print("⛔️ 403 con start/sz. Intentaremos paginar por enlaces HTML si hay.")
-            else:
-                print(f"⚠️ Error de red con start/sz: {e}")
-        except Exception as e:
-            print(f"⚠️ Error general con start/sz: {e}")
-
-    # 3) Paginación por enlaces reales
-    page_idx = 0
-    empty_streak = 0
-    while page_idx < max_pages and next_url:
-        page_idx += 1
-        try:
-            htmln, urln = fetch_html(session, next_url)
-        except requests.HTTPError as e:
-            sc = getattr(e.response, "status_code", None)
-            print(f"⚠️ Next {page_idx} {sc} en {next_url}")
-            if sc in (403, 429):
-                time.sleep(random.uniform(1.0, 2.2))
-                try:
-                    htmln, urln = fetch_html(session, next_url)
-                except Exception:
-                    if sc == 403:
-                        blocked_403 = True
-                    break
-            else:
-                if sc == 403:
-                    blocked_403 = True
-                break
-        except Exception as e:
-            print(f"⚠️ Next {page_idx} error: {e}")
+    product_nodes = []
+    for tag, attrs in candidates:
+        nodes = soup.find_all(tag, attrs=attrs)
+        if nodes:
+            product_nodes = nodes
             break
 
-        page_rows, tiles_count = parse_products_from_html(
-            htmln, urln, page_start=None, page_idx=page_idx, captured_at_iso=captured_at
-        )
-        got = add_rows(page_rows)
-        print(f"Página {page_idx} (link): tiles={tiles_count}, nuevos={got}")
+    if not product_nodes:
+        product_nodes = soup.select('[data-product-id], [data-sku], [data-pid]')
 
-        if tiles_count == 0:
-            empty_streak += 1
-            if empty_streak >= stop_after_empty:
-                print(f"∎ Corte por páginas vacías consecutivas: {empty_streak}")
+    if not product_nodes:
+        anchors = soup.select("a[href*='/p/'], a[href*='/product/'], a[href*='pid=']")
+        for a in anchors:
+            product_nodes.append(a.parent if a.parent else a)
+
+    for node in product_nodes:
+        a = node.find("a", href=True)
+        href = a["href"].strip() if a else None
+        if href and href.startswith("/"):
+            href = urljoin(base_url, href)
+
+        title = None
+        name_node = node.find(attrs={"class": re.compile(r"name|title|product-name", re.I)}) or node.find("h3") or node.find("h2")
+        if name_node:
+            title = " ".join(name_node.get_text(" ").split())
+
+        price_text = ""
+        price_node = node.find(attrs={"class": re.compile(r"price|pricing|sales|value", re.I)})
+        if price_node:
+            price_text = " ".join(price_node.get_text(" ").split())
+        if not price_text:
+            m = re.search(r"\$\s?[\d\.,]+", node.get_text(" "), re.I)
+            if m:
+                price_text = m.group(0)
+
+        brand = None
+        brand_node = node.find(attrs={"class": re.compile(r"brand", re.I)})
+        if brand_node:
+            brand = " ".join(brand_node.get_text(" ").split())
+
+        pid = node.get("data-product-id") or node.get("data-pid") or node.get("data-sku")
+
+        out.append({
+            "title": title,
+            "price_raw": price_text,
+            "brand": brand,
+            "url": href,
+            "pid": pid,
+        })
+
+    cleaned = []
+    for r in out:
+        if not r.get("title") and not r.get("url"):
+            continue
+        cleaned.append(r)
+
+    return cleaned
+
+
+def scrape_category(
+    name: str,
+    base_url: str,
+    page_size: int = 200,
+    max_pages: int = 200,
+    step: int = 200,
+) -> pd.DataFrame:
+    """
+    Recorre páginas como ?start=0&sz=200, ?start=200&sz=200, ...
+    Devuelve un DataFrame (posiblemente vacío si hubo 403 o sin parsear).
+    """
+    all_rows: List[Dict] = []
+    start = 0
+    errors_in_row = 0
+    max_consecutive_errors = 3
+
+    logging.info(f"=== {name} ===")
+    logging.info(f"URL base: {base_url}")
+    logging.info(f"start={start}, sz={page_size}, step={step}, max_pages={max_pages}")
+
+    for page in range(max_pages):
+        list_url = build_list_url(base_url, start=start, sz=page_size)
+        html = fetch_url(list_url)
+
+        if not html:
+            errors_in_row += 1
+            logging.warning(f"⚠️ Error de red start={start}")
+            if errors_in_row >= max_consecutive_errors:
+                logging.error("Fin por errores consecutivos.")
                 break
-        else:
-            empty_streak = 0
+            start += step
+            sleep_jitter(0.4, 0.3)
+            continue
 
-        soup = BeautifulSoup(htmln, "html.parser")
-        next_url = extract_next_page_url(soup, urln)
+        errors_in_row = 0
+        rows = parse_listing(html, base_url=base_url)
 
-        pause = random.uniform(JITTER_MIN, JITTER_MAX)
-        if random.random() < 0.2:
-            pause += random.uniform(0.6, 1.2)
-        time.sleep(pause)
+        logging.info(f"start={start} -> {len(rows)} filas")
+        all_rows.extend(rows)
 
-    # ===================== Salida / Email ====================================
-    rows_count = len(all_rows)
-    big_disc = sum(1 for r in all_rows if (r.get("descuento_pct") or 0) >= 50)
+        if len(rows) == 0:
+            next_html = fetch_url(build_list_url(base_url, start=start + step, sz=page_size))
+            if not next_html:
+                logging.warning("Siguiente página también falló (posible bloqueo). Cortamos.")
+                break
+            next_rows = parse_listing(next_html, base_url=base_url)
+            if len(next_rows) == 0:
+                logging.info("Dos páginas seguidas sin resultados. Cortamos.")
+                break
+            else:
+                all_rows.extend(next_rows)
+                start += step * 2
+                continue
 
+        start += step
+        sleep_jitter(0.4, 0.3)
+
+    if not all_rows:
+        return pd.DataFrame(columns=["title", "price_raw", "brand", "url", "pid", "categoria"])
     df = pd.DataFrame(all_rows)
-    saved_path = None
-    attachments: List[str] = []
+    df["categoria"] = name
+    return df
 
-    # Si hubo bloqueo y quedó en 0 filas, correo de error explícito
-    if rows_count == 0 and blocked_403:
-        subj = f"[Scraper][ERROR 403] {out_prefix} bloqueado"
-        body = (f"Categoría: {cat_key}\n"
-                f"Resultado: BLOQUEADO (403)\n"
-                f"URL base: {base_url}\n"
-                f"Filas: 0\n"
-                f"Se intentó fallback por enlaces HTML.\n"
-                f"Histórico: {'sí' if historical else 'no'}\n"
-                f"Guardado: {SAVE_DIR}\n")
-        send_email(subj, body, EMAIL_TO_LIST, attachments=None)
-        return {"category": cat_key, "ok": False, "rows": 0, "big_disc": 0}
 
-    # Si hay filas, guardamos Excel y notificamos normal
-    if rows_count > 0:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"{out_prefix}_{ts}.xlsx"
-        saved_path = os.path.join(SAVE_DIR, fname)
-        os.makedirs(os.path.dirname(saved_path), exist_ok=True)
-        with pd.ExcelWriter(saved_path, engine="xlsxwriter") as xw:
-            df.to_excel(xw, index=False)
-        attachments.append(saved_path)
+# =========================
+# Salidas (Excel/Parquet)
+# =========================
 
-    subj = f"[Scraper] {cat_key} listo ({datetime.now().strftime('%Y%m%d_%H%M%S')})"
-    body = (f"Categoría: {cat_key}\n"
-            f"Filas: {rows_count}\n"
-            f"≥50% desc.: {big_disc}\n"
-            f"Adjunto: {os.path.basename(saved_path) if saved_path else '—'}\n"
-            f"Histórico: {'sí' if historical else 'no'}\n"
-            f"Guardado: {SAVE_DIR}\n")
-    send_email(subj, body, EMAIL_TO_LIST, attachments=attachments if attachments else None)
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
-    return {"category": cat_key, "ok": True, "rows": rows_count, "big_disc": big_disc}
 
-# ===================== FIN PATCH PALACIO GROUP A ============================
+def save_outputs(df: pd.DataFrame, categoria: str, outdir: str, prefix: str = "palacio") -> Tuple[str, str]:
+    ensure_dir(outdir)
+    stamp = ts_for_filename()
+
+    parquet_name = f"{prefix}_{categoria}_snapshot_{stamp}.parquet".replace("__", "_")
+    excel_name = f"{prefix}_{categoria}_snapshot_{stamp}.xlsx".replace("__", "_")
+
+    parquet_path = os.path.join(outdir, parquet_name)
+    excel_path = os.path.join(outdir, excel_name)
+
+    try:
+        df.to_parquet(parquet_path, index=False)
+        logging.info(f"💾 Parquet: {parquet_path}")
+    except Exception as e:
+        logging.warning(f"No se pudo guardar Parquet: {e}")
+
+    try:
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as xw:
+            df.to_excel(xw, index=False, sheet_name="data")
+        logging.info(f"💾 Excel:   {excel_path}")
+    except Exception as e:
+        logging.error(f"No se pudo guardar Excel: {e}")
+        excel_path = ""
+
+    return parquet_path, excel_path
+
+
+# =========================
+# Email
+# =========================
+
+def smtp_env() -> Dict[str, str]:
+    return {
+        "host": os.environ.get("SMTP_HOST", ""),
+        "port": os.environ.get("SMTP_PORT", "587"),
+        "user": os.environ.get("SMTP_USER", ""),
+        "password": os.environ.get("SMTP_PASS", ""),
+        "from": os.environ.get("SMTP_FROM", os.environ.get("SMTP_USER", "")),
+        "to": os.environ.get("SMTP_TO", ""),
+    }
+
+
+def send_email(subject: str, body: str, attachments: List[str]) -> None:
+    cfg = smtp_env()
+    missing = [k for k, v in cfg.items() if not v and k in ("host", "port", "user", "password", "from")]
+    if missing:
+        logging.warning(f"⚠️ Email NO enviado, faltan variables: {missing}")
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg["from"]
+    msg["To"] = cfg["to"] or cfg["from"]
+    msg.set_content(body)
+
+    for path in attachments:
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, "rb") as f:
+            data = f.read()
+        fname = os.path.basename(path)
+        maintype, subtype = ("application", "octet-stream")
+        if fname.lower().endswith(".xlsx"):
+            maintype, subtype = ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        elif fname.lower().endswith(".parquet"):
+            maintype, subtype = ("application", "octet-stream")
+
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fname)
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP(cfg["host"], int(cfg["port"])) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
+        server.login(cfg["user"], cfg["password"])
+        server.send_message(msg)
+        logging.info(f"📧 Email enviado a {msg['To']}: {subject}")
+
+
+# =========================
+# Orquestación por categoría / grupo
+# =========================
+
+CATEGORIAS_GRUPO_A: Dict[str, str] = {
+    "mujer": "https://www.elpalaciodehierro.com/mujer/",
+    "hogar": "https://www.elpalaciodehierro.com/hogar/",
+    # Puedes añadir más aquí:
+    # "electronica": "https://www.elpalaciodehierro.com/electronica/",
+    # "deportes": "https://www.elpalaciodehierro.com/deportes/",
+}
+
+
+def run_categoria(
+    nombre: str,
+    base_url: str,
+    outdir: str,
+    page_size: int = 200,
+    max_pages: int = 200,
+    step: int = 200,
+    enviar_correo: bool = True,
+    umbral_desc_porcentaje: int = 50,
+    historico: bool = True,
+) -> Tuple[pd.DataFrame, str, str]:
+    """
+    Ejecuta scraping de 1 categoría, guarda outputs y (opcional) manda correo.
+    Retorna (df, parquet_path, excel_path).
+    """
+    t0 = time.time()
+    df = scrape_category(nombre, base_url, page_size=page_size, max_pages=max_pages, step=step)
+
+    parquet_path, excel_path = save_outputs(
+        df,
+        categoria=nombre,
+        outdir=outdir,
+        prefix="palacio"
+    )
+
+    filas = len(df)
+    desc_count = 0
+    if not df.empty:
+        desc_count = df["price_raw"].fillna("").str.contains(
+            rf"{umbral_desc_porcentaje}\s?%|{umbral_desc_porcentaje}\s?%\s?desc", flags=re.I, regex=True
+        ).sum()
+
+    asunto = f"[Scraper] palacio_{nombre} listo ({ts_for_filename()})"
+    cuerpo = (
+        f"Categoría: {nombre}\n"
+        f"Filas: {filas}\n"
+        f"≥{umbral_desc_porcentaje}% desc.: {desc_count}\n"
+        f"Adjunto: {os.path.basename(excel_path) if excel_path else '(sin excel)'}\n"
+        f"Histórico: {'sí' if historico else 'no'}\n"
+        f"Guardado: {outdir}\n"
+        f"Fin: {tz_now_iso()}\n"
+        f"Duración: {time.time() - t0:.1f}s\n"
+    )
+
+    logging.info("\n" + cuerpo)
+
+    if enviar_correo:
+        send_email(
+            subject=asunto,
+            body=cuerpo,
+            attachments=[excel_path] if excel_path else []
+        )
+
+    return df, parquet_path, excel_path
+
+
+def run_grupo_a_todo(
+    outdir: str,
+    enviar_correo: bool = True,
+    page_size: int = 200,
+    max_pages: int = 200,
+    step: int = 200,
+) -> None:
+    logging.info("▶ Ejecutando TODAS las categorías del grupo…")
+    for nombre, base in CATEGORIAS_GRUPO_A.items():
+        sleep_jitter(1.2, 0.9)
+        try:
+            run_categoria(
+                nombre=nombre,
+                base_url=base,
+                outdir=outdir,
+                page_size=page_size,
+                max_pages=max_pages,
+                step=step,
+                enviar_correo=enviar_correo,
+            )
+            sleep_jitter(1.33, 0.4)
+        except Exception as e:
+            logging.exception(f"Error en categoría {nombre}: {e}")
+    logging.info("🎉 Terminaron todas.")
+
+
+# =========================
+# CLI (MAIN)
+# =========================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Scraper grupo A de El Palacio de Hierro")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--all", action="store_true", help="Ejecuta todas las categorías del grupo A")
+    g.add_argument("--cat", nargs="+", help="Una o más categorías específicas (p.ej. --cat mujer hogar)")
+
+    p.add_argument("--outdir", default="./salidas_palacio", help="Directorio de salida (parquet/excel)")
+    p.add_argument("--no-email", action="store_true", help="No enviar correo")
+    p.add_argument("--page-size", type=int, default=200)
+    p.add_argument("--max-pages", type=int, default=200)
+    p.add_argument("--step", type=int, default=200)
+    p.add_argument("-v", "--verbose", action="count", default=0, help="Más logs (-v, -vv)")
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    log_setup(args.verbose)
+
+    enviar_correo = not args.no_email
+    outdir = args.outdir
+
+    if args.all:
+        run_grupo_a_todo(
+            outdir=outdir,
+            enviar_correo=enviar_correo,
+            page_size=args.page_size,
+            max_pages=args.max_pages,
+            step=args.step,
+        )
+        return 0
+
+    cats = [c.strip().lower() for c in args.cat]
+    invalid = [c for c in cats if c not in CATEGORIAS_GRUPO_A]
+    if invalid:
+        validos = ", ".join(sorted(CATEGORIAS_GRUPO_A.keys()))
+        logging.error(f"Categorías inválidas: {invalid}. Válidas: {validos}")
+        return 2
+
+    for c in cats:
+        base = CATEGORIAS_GRUPO_A[c]
+        run_categoria(
+            nombre=c,
+            base_url=base,
+            outdir=outdir,
+            enviar_correo=enviar_correo,
+            page_size=args.page_size,
+            max_pages=args.max_pages,
+            step=args.step,
+        )
+        sleep_jitter(1.1, 0.5)
+
+    logging.info("✅ Listo.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
