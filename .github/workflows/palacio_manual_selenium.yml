@@ -1,0 +1,112 @@
+name: Palacio Manual (Selenium)
+
+on:
+  workflow_dispatch:
+    inputs:
+      category:
+        description: "Categoría (opcional; si vacío te toma la interactiva del script)"
+        required: false
+        default: ""
+      max_pages:
+        description: "Páginas a recorrer"
+        required: true
+        default: "40"
+      headless:
+        description: "Ejecutar con navegador visible?"
+        required: true
+        type: choice
+        options: ["true","false"]
+        default: "true"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SAVE_DIR: /tmp/palacio_out
+      # Email / alertas (usa tus secrets)
+      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
+      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
+      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
+      ALERT_BRANDS: ${{ secrets.ALERT_BRANDS }}
+      # (Opcional) Drive via rclone
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+      RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Instala Google Chrome para que webdriver-manager encuentre el binario
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper (manual)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$SAVE_DIR"
+
+          args=( )
+          if [[ -n "${{ github.event.inputs.category }}" ]]; then
+            args+=("-c" "${{ github.event.inputs.category }}")
+          fi
+          args+=("--max-pages" "${{ github.event.inputs.max_pages }}")
+          if [[ "${{ github.event.inputs.headless }}" == "false" ]]; then
+            args+=("--no-headless")
+          fi
+
+          echo "Args: ${args[@]-<none>}"
+          python palacio_manual_runner_selenium.py "${args[@]}"
+
+      - name: Upload artifacts (XLSX/Parquet)
+        uses: actions/upload-artifact@v4
+        with:
+          name: palacio-manual-selenium
+          path: |
+            ${{ env.SAVE_DIR }}/*.xlsx
+            ${{ env.SAVE_DIR }}/*.parquet
+          if-no-files-found: warn
+          retention-days: 7
+
+      # (Opcional) Subir a Drive si configuraste secrets de rclone
+      - name: Upload to Google Drive (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${RCLONE_CONFIG}" && -z "${GDRIVE_SERVICE_ACCOUNT_JSON}" ]]; then
+            echo "Sin RCLONE_CONFIG ni GDRIVE_SERVICE_ACCOUNT_JSON: omito subida a Drive."
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y rclone
+          mkdir -p ~/.config/rclone
+          if [[ -n "${RCLONE_CONFIG}" ]]; then
+            printf '%s\n' "${RCLONE_CONFIG}" > ~/.config/rclone/rclone.conf
+          else
+            [[ -n "${GDRIVE_SERVICE_ACCOUNT_JSON}" && -n "${GDRIVE_FOLDER_ID}" ]] || { echo "Faltan credenciales de SA o GDRIVE_FOLDER_ID"; exit 0; }
+            printf '%s' "${GDRIVE_SERVICE_ACCOUNT_JSON}" > "$GITHUB_WORKSPACE/sa.json"
+            {
+              echo "[gdrive]"
+              echo "type = drive"
+              echo "scope = drive"
+              echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
+              echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
+            } > ~/.config/rclone/rclone.conf
+          fi
+          rclone copy "$SAVE_DIR" gdrive: --include "*.xlsx" --include "*.parquet" -v --retries 3 --transfers 4 --checkers 8
