@@ -1,0 +1,179 @@
+name: Palacio Manual Runner (Selenium v3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: "Preset(s) por coma (ej: hombre,gourmet). Ignorado si llenas URLs."
+        required: false
+        default: "hombre"
+        type: string
+      urls:
+        description: "URLs (una por línea). Si llenas esto, sobre-escribe presets."
+        required: false
+        default: ""
+        type: string
+      max_pages:
+        description: "Máx páginas por URL (paginación)"
+        required: false
+        default: "2"
+        type: string
+      headless:
+        description: "Correr Chrome en headless"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      discount_threshold:
+        description: "Umbral % descuento (stats + watchlist alerts)"
+        required: false
+        default: "51"
+        type: string
+      send_email:
+        description: "Enviar correo del XLSX final"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      watchlist_alerts:
+        description: "Alertas WATCHLIST (solo NEW/CHANGES y >= umbral)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      upload_drive:
+        description: "Subir outputs/history a Google Drive (rclone)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      drive_subdir:
+        description: "Subcarpeta dentro del root_folder_id (ej: manual_runs)"
+        required: false
+        default: "manual_runs"
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      # salida local
+      OUT_DIR: outputs
+      HISTORY_DIR: outputs/history
+
+      # Email (secrets)
+      EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
+      EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
+      EMAIL_USER:  ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
+      EMAIL_TO:    ${{ secrets.EMAIL_TO }}
+      EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
+
+      # Watchlist
+      WATCHLIST_BRANDS: ${{ secrets.WATCHLIST_BRANDS }}
+
+      # Drive/rclone
+      RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
+      SA_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Chrome estable (evita mismatch/chrome crash)
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_manual.txt
+
+      - name: Instalar rclone
+        if: ${{ inputs.upload_drive == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Configurar rclone
+        if: ${{ inputs.upload_drive == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/rclone
+
+          if [[ -n "${RCLONE_CONFIG_SECRET:-}" ]]; then
+            echo "Usando RCLONE_CONFIG"
+            printf '%s\n' "$RCLONE_CONFIG_SECRET" > ~/.config/rclone/rclone.conf
+          else
+            echo "Construyendo rclone.conf con Service Account"
+            [[ -n "${SA_JSON:-}" && -n "${GDRIVE_FOLDER_ID:-}" ]] || { echo "Faltan SA_JSON o GDRIVE_FOLDER_ID"; exit 1; }
+            printf '%s' "$SA_JSON" > "$GITHUB_WORKSPACE/sa.json"
+            {
+              echo "[gdrive]"
+              echo "type = drive"
+              echo "scope = drive"
+              echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
+              echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
+            } > ~/.config/rclone/rclone.conf
+          fi
+
+          rclone listremotes
+
+      - name: Preparar carpetas locales
+        run: |
+          mkdir -p "$OUT_DIR"
+          mkdir -p "$HISTORY_DIR"
+
+      - name: Bajar histórico (.parquet) desde Drive
+        if: ${{ inputs.upload_drive == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REM="${{ inputs.drive_subdir }}"
+          # Trae históricos (si no hay, no falla)
+          rclone copy "gdrive:${REM}/history" "$HISTORY_DIR" --include "*_snapshot_*.parquet" -v --retries 3 || true
+          ls -lh "$HISTORY_DIR" || true
+
+      - name: Run scraper (manual)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Running presets='${{ inputs.preset }}' max_pages=${{ inputs.max_pages }} headless=${{ inputs.headless }}"
+          python palacio_manual_runner_selenium_v3.py \
+            --presets "${{ inputs.preset }}" \
+            --urls "${{ inputs.urls }}" \
+            --max-pages "${{ inputs.max_pages }}" \
+            --headless "${{ inputs.headless }}" \
+            --discount-threshold "${{ inputs.discount_threshold }}" \
+            --send-email "${{ inputs.send_email }}" \
+            --watchlist-alerts "${{ inputs.watchlist_alerts }}" \
+            --out-dir "$OUT_DIR" \
+            --history-dir "$HISTORY_DIR"
+
+      - name: Subir outputs/history a Drive (subcarpeta)
+        if: ${{ inputs.upload_drive == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REM="${{ inputs.drive_subdir }}"
+          rclone copy "$OUT_DIR" "gdrive:${REM}" -v --retries 3 --transfers 4 --checkers 8
+          rclone copy "$HISTORY_DIR" "gdrive:${REM}/history" -v --retries 3 --transfers 4 --checkers 8
+
+      - name: Upload artifacts (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: palacio-manual-outputs
+          path: |
+            outputs/*.xlsx
+            outputs/history/*.parquet
+          if-no-files-found: ignore
+          retention-days: 3
