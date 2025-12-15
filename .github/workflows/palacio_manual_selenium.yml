@@ -1,36 +1,59 @@
-name: Palacio Manual Runner (Selenium)
+name: Palacio Manual Runner (Selenium v2)
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Modo de ejecución"
+        type: choice
+        required: true
+        default: preset
+        options:
+          - preset
+          - urls
+          - discover
+
       presets:
-        description: "Presets (comma). Ej: hombre,mujer,belleza. Vacío si usarás urls."
+        description: "Presets (coma). Ej: hombre,mujer,hogar,gourmet  (solo si mode=preset)"
+        type: string
         required: false
         default: "hombre"
+
       urls:
-        description: "URLs (una por línea). Si se llena, sobre-escribe presets."
+        description: "URLs (una por línea) (solo si mode=urls)"
+        type: string
         required: false
         default: ""
+
       max_pages:
-        description: "Máx páginas por URL"
-        required: false
-        default: "8"
+        description: "Máx páginas por URL (entero). Ej: 2, 5, 10"
+        type: string
+        required: true
+        default: "2"
+
       headless:
-        description: "true/false"
-        required: false
-        default: "true"
+        description: "Correr Chrome en headless (recomendado en GitHub Actions)"
+        type: boolean
+        required: true
+        default: true
+
       discount_threshold:
-        description: "Umbral % para alertas (watchlist)"
-        required: false
+        description: "Umbral % descuento para alertas por marcas (watchlist). Ej: 51"
+        type: string
+        required: true
         default: "51"
+
       send_email:
-        description: "true/false"
-        required: false
-        default: "false"
+        description: "Enviar alertas por correo (solo si hay NEW/CHANGED + descuento + marca en watchlist)"
+        type: boolean
+        required: true
+        default: false
+
       upload_drive:
-        description: "true/false"
-        required: false
-        default: "true"
+        description: "Subir resultados a Google Drive (XLSX + history/*.parquet)"
+        type: boolean
+        required: true
+        default: true
 
 permissions:
   contents: read
@@ -57,32 +80,38 @@ jobs:
       - name: Setup Chrome
         uses: browser-actions/setup-chrome@v1
 
-      - name: Write urls.txt
-        if: ${{ inputs.urls != '' }}
+      # ✅ ESTE ERA EL QUE FALTABA
+      - name: Install rclone (si upload_drive=true)
+        if: ${{ inputs.upload_drive }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+
+      - name: Prepare urls.txt (si mode=urls)
+        if: ${{ inputs.mode == 'urls' }}
         run: |
           printf "%s" "${{ inputs.urls }}" > urls.txt
-          echo "urls.txt created:"
-          sed -n '1,200p' urls.txt
+          echo "urls.txt:"
+          sed -n '1,120p' urls.txt
 
-      - name: Prepare rclone config
-        if: ${{ inputs.upload_drive == 'true' }}
+      - name: Setup rclone config (si upload_drive=true)
+        if: ${{ inputs.upload_drive }}
         env:
           RCLONE_CONF_TEXT: ${{ secrets.RCLONE_CONFIG }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.config/rclone
           printf "%s" "$RCLONE_CONF_TEXT" > ~/.config/rclone/rclone.conf
-          rclone config show >/dev/null
+          rclone version
+          rclone listremotes
 
-      - name: Pull history snapshots (optional)
-        if: ${{ inputs.upload_drive == 'true' }}
-        env:
-          RCLONE_REMOTE: ${{ secrets.RCLONE_REMOTE }}   # ej: gdrive
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      - name: Pull history snapshots (si upload_drive=true)
+        if: ${{ inputs.upload_drive }}
         run: |
+          set -euo pipefail
           mkdir -p outputs/history
-          # trae parquets recientes para poder diffs
-          rclone copy "${RCLONE_REMOTE}:${DRIVE_FOLDER_ID}" outputs/history \
-            --include "*_snapshot_*.parquet" --max-age 45d || true
+          rclone copy "gdrive:" "outputs/history" --include "*_snapshot_*.parquet" -v --retries 3 || true
+          ls -lh outputs/history || true
 
       - name: Run scraper
         env:
@@ -92,16 +121,27 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO:   ${{ secrets.EMAIL_TO }}
+        shell: bash
         run: |
-          python palacio_manual_runner_selenium_v2.py \
-            --presets "${{ inputs.presets }}" \
-            --urls-file "${{ inputs.urls != '' && 'urls.txt' || '' }}" \
-            --max-pages "${{ inputs.max_pages }}" \
-            --headless "${{ inputs.headless }}" \
-            --discount-threshold "${{ inputs.discount_threshold }}" \
-            --send-email "${{ inputs.send_email }}" \
-            --out-dir "outputs" \
-            --history-dir "outputs/history"
+          set -euo pipefail
+
+          args=(--max-pages "${{ inputs.max_pages }}"
+                --headless "${{ inputs.headless }}"
+                --discount-threshold "${{ inputs.discount_threshold }}"
+                --send-email "${{ inputs.send_email }}"
+                --out-dir "outputs"
+                --history-dir "outputs/history")
+
+          if [[ "${{ inputs.mode }}" == "discover" ]]; then
+            args+=(--discover true)
+          elif [[ "${{ inputs.mode }}" == "urls" ]]; then
+            args+=(--urls-file "urls.txt")
+          else
+            args+=(--presets "${{ inputs.presets }}")
+          fi
+
+          echo "Running: python palacio_manual_runner_selenium_v2.py ${args[*]}"
+          python palacio_manual_runner_selenium_v2.py "${args[@]}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -109,12 +149,10 @@ jobs:
           name: outputs
           path: outputs/**
 
-      - name: Upload outputs to Drive
-        if: ${{ inputs.upload_drive == 'true' }}
-        env:
-          RCLONE_REMOTE: ${{ secrets.RCLONE_REMOTE }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      - name: Upload outputs to Drive (si upload_drive=true)
+        if: ${{ inputs.upload_drive }}
         run: |
-          rclone copy outputs "${RCLONE_REMOTE}:${DRIVE_FOLDER_ID}" \
+          set -euo pipefail
+          rclone copy "outputs" "gdrive:" \
             --include "*.xlsx" --include "history/*.parquet" \
-            --create-empty-src-dirs
+            --create-empty-src-dirs -v --retries 3
