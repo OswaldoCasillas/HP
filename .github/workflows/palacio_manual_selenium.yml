@@ -1,112 +1,99 @@
-name: Palacio Manual (Selenium)
+name: Palacio Manual Runner (Selenium)
 
 on:
   workflow_dispatch:
     inputs:
-      category:
-        description: "Categoría (opcional; si vacío te toma la interactiva del script)"
-        required: false
-        default: ""
-      max_pages:
-        description: "Páginas a recorrer"
+      category_or_url:
+        description: "Número de categoría (1..N) o URL completa (si empieza con http)"
         required: true
-        default: "40"
+        default: "2"  # 1=mujer, 2=hombre, 3=niña, 4=niño, 5=hogar, 6=belleza, 7=ofertas, o pega URL
       headless:
-        description: "Ejecutar con navegador visible?"
+        description: "Headless? true/false"
         required: true
-        type: choice
-        options: ["true","false"]
         default: "true"
+      max_pages:
+        description: "Máximo de páginas a recorrer"
+        required: true
+        default: "50"
+      out_prefix:
+        description: "Prefijo de archivos (para snapshots/alerts)"
+        required: true
+        default: "palacio_manual"
 
 jobs:
-  run:
+  run-manual:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
     env:
       SAVE_DIR: /tmp/palacio_out
-      # Email / alertas (usa tus secrets)
+      # Email (opcionales si quieres alertas)
       EMAIL_HOST:  ${{ secrets.EMAIL_HOST }}
       EMAIL_PORT:  ${{ secrets.EMAIL_PORT }}
       EMAIL_USER:  ${{ secrets.EMAIL_USER }}
       EMAIL_PASS:  ${{ secrets.EMAIL_PASS }}
       EMAIL_TO:    ${{ secrets.EMAIL_TO }}
       EMAIL_DEBUG: ${{ secrets.EMAIL_DEBUG }}
-      ALERT_BRANDS: ${{ secrets.ALERT_BRANDS }}
-      # (Opcional) Drive via rclone
-      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-      GDRIVE_SERVICE_ACCOUNT_JSON: ${{ secrets.GDRIVE_SERVICE_ACCOUNT_JSON }}
-      RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+      # Alertas
+      PALACIO_ALERT_BRANDS: ${{ secrets.PALACIO_ALERT_BRANDS }}
+      ALERT_MIN_DISC: ${{ secrets.ALERT_MIN_DISC }}
+
+      # Inputs -> ENV para el script
+      HEADLESS: ${{ github.event.inputs.headless }}
+      MAX_PAGES: ${{ github.event.inputs.max_pages }}
+      OUT_PREFIX: ${{ github.event.inputs.out_prefix }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Instala Google Chrome para que webdriver-manager encuentre el binario
-      - name: Setup Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-
-      - name: Setup Python
+      - name: Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scraper (manual)
+      - name: Resolver category/URL a ENV
+        id: sel
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$SAVE_DIR"
-
-          args=( )
-          if [[ -n "${{ github.event.inputs.category }}" ]]; then
-            args+=("-c" "${{ github.event.inputs.category }}")
+          IN="${{ github.event.inputs.category_or_url }}"
+          if [[ "$IN" =~ ^https?:// ]]; then
+            echo "url=$IN" >> $GITHUB_OUTPUT
+          else
+            case "$IN" in
+              1) echo "url=https://www.elpalaciodehierro.com/mujer/"   >> $GITHUB_OUTPUT ;;
+              2) echo "url=https://www.elpalaciodehierro.com/hombre/"  >> $GITHUB_OUTPUT ;;
+              3) echo "url=https://www.elpalaciodehierro.com/nina/"    >> $GITHUB_OUTPUT ;;
+              4) echo "url=https://www.elpalaciodehierro.com/nino/"    >> $GITHUB_OUTPUT ;;
+              5) echo "url=https://www.elpalaciodehierro.com/hogar/"   >> $GITHUB_OUTPUT ;;
+              6) echo "url=https://www.elpalaciodehierro.com/belleza/" >> $GITHUB_OUTPUT ;;
+              7) echo "url=https://www.elpalaciodehierro.com/outlet/"  >> $GITHUB_OUTPUT ;;
+              *) echo "url=https://www.elpalaciodehierro.com/hombre/"  >> $GITHUB_OUTPUT ;;
+            esac
           fi
-          args+=("--max-pages" "${{ github.event.inputs.max_pages }}")
-          if [[ "${{ github.event.inputs.headless }}" == "false" ]]; then
-            args+=("--no-headless")
-          fi
 
-          echo "Args: ${args[@]-<none>}"
-          python palacio_manual_runner_selenium.py "${args[@]}"
+      - name: Ejecutar runner manual
+        env:
+          TARGET_URL: ${{ steps.sel.outputs.url }}
+        run: |
+          python palacio_manual_runner_selenium.py <<EOF
+          ${{ github.event.inputs.category_or_url }}
+          ${{ env.HEADLESS }}
+          ${{ env.MAX_PAGES }}
+          ${{ env.OUT_PREFIX }}
+          EOF
 
-      - name: Upload artifacts (XLSX/Parquet)
+      - name: Subir artefactos (XLSX + PARQUET)
         uses: actions/upload-artifact@v4
         with:
-          name: palacio-manual-selenium
+          name: palacio-manual-outputs
           path: |
-            ${{ env.SAVE_DIR }}/*.xlsx
-            ${{ env.SAVE_DIR }}/*.parquet
-          if-no-files-found: warn
-          retention-days: 7
-
-      # (Opcional) Subir a Drive si configuraste secrets de rclone
-      - name: Upload to Google Drive (optional)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${RCLONE_CONFIG}" && -z "${GDRIVE_SERVICE_ACCOUNT_JSON}" ]]; then
-            echo "Sin RCLONE_CONFIG ni GDRIVE_SERVICE_ACCOUNT_JSON: omito subida a Drive."
-            exit 0
-          fi
-          sudo apt-get update && sudo apt-get install -y rclone
-          mkdir -p ~/.config/rclone
-          if [[ -n "${RCLONE_CONFIG}" ]]; then
-            printf '%s\n' "${RCLONE_CONFIG}" > ~/.config/rclone/rclone.conf
-          else
-            [[ -n "${GDRIVE_SERVICE_ACCOUNT_JSON}" && -n "${GDRIVE_FOLDER_ID}" ]] || { echo "Faltan credenciales de SA o GDRIVE_FOLDER_ID"; exit 0; }
-            printf '%s' "${GDRIVE_SERVICE_ACCOUNT_JSON}" > "$GITHUB_WORKSPACE/sa.json"
-            {
-              echo "[gdrive]"
-              echo "type = drive"
-              echo "scope = drive"
-              echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
-              echo "service_account_file = ${GITHUB_WORKSPACE}/sa.json"
-            } > ~/.config/rclone/rclone.conf
-          fi
-          rclone copy "$SAVE_DIR" gdrive: --include "*.xlsx" --include "*.parquet" -v --retries 3 --transfers 4 --checkers 8
+            /tmp/palacio_out/*.xlsx
+            /tmp/palacio_out/*.parquet
+          if-no-files-found: ignore
+          retention-days: 5
