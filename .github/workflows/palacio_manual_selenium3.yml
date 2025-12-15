@@ -95,7 +95,7 @@ jobs:
       - name: Instalar dependencias
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_manual.txt
+          pip install -r requirements.txt
 
       - name: Instalar rclone
         if: ${{ inputs.upload_drive == 'true' }}
