@@ -6,18 +6,13 @@
 # - Alertas por marca (NEW/CHANGES con descuento ≥ ALERT_MIN_DISC) -> email
 # - Genera XLSX (hoja SNAPSHOT)
 # Reqs: selenium webdriver-manager pandas xlsxwriter openpyxl
-# Secrets/ENV (opcional): 
-#   SAVE_DIR=/tmp/palacio_out
-#   EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_TO, EMAIL_DEBUG=0/1
-#   PALACIO_ALERT_BRANDS="Le Labo,Saint Laurent Paris,Marc Jacobs,..."
-#   ALERT_MIN_DISC=30
+# Env opcional: SAVE_DIR, EMAIL_*, PALACIO_ALERT_BRANDS, ALERT_MIN_DISC
 # ──────────────────────────────────────────────────────────────────────────────
 
-import os, re, time, random, smtplib, io, sys
+import os, re, time, random, smtplib, io
 from email.message import EmailMessage
 from pathlib import Path
 from datetime import datetime, timezone
-
 import pandas as pd
 
 # Selenium
@@ -45,7 +40,6 @@ UA_LIST = [
 ]
 
 LIST_SELECTORS = [
-    # PLP nueva / variantes vistas en el HTML
     "article.b-product_tile_item",
     "div.b-product_tile[data-component='search/ProductTile']",
     "div.b-product_tile",
@@ -57,18 +51,6 @@ LIST_SELECTORS = [
 PRICE_BLOCKS = [
     ".b-product_tile-price", ".b-product_price",
     ".b-product_tile .b-product_price", ".product-pricing"
-]
-
-OLD_PRICE_HINT = "[class*='price-old'], .b-product_price-old"
-SALE_PRICE_HINT = "[class*='price-sales'], .b-product_price-sales"
-
-PAGINATION_NEXT = [
-    "a[data-js-pagination-link][aria-label*='Siguiente']",
-    ".b-pagination-elements_list .b-next-btn a",
-    ".b-pagination-elements_next a",
-    "li.b-pagination-elements_list.b-next-btn a",
-    "a.b-pagination-elements_number[aria-label*='Siguiente']",
-    "a[rel='next']",
 ]
 
 _money_clean = re.compile(r"[^\d.,]")
@@ -83,9 +65,9 @@ def parse_price(txt):
 
 def _env_bool(name, default=False):
     v = os.environ.get(name, "")
-    if v == "": 
+    if v == "":
         return default
-    return v not in ("0", "false", "False", "no", "NO")
+    return v.lower() not in ("0", "false", "no")
 
 def setup_driver(headless=True):
     co = ChromeOptions()
@@ -98,7 +80,6 @@ def setup_driver(headless=True):
     co.add_argument("--lang=es-MX")
     co.add_argument("--disable-blink-features=AutomationControlled")
     co.add_argument(f"--user-agent={random.choice(UA_LIST)}")
-    # endurecer contra OOM
     co.add_argument("--disable-background-timer-throttling")
     co.add_argument("--disable-renderer-backgrounding")
     co.add_argument("--disable-backgrounding-occluded-windows")
@@ -139,8 +120,16 @@ def _robust_click(driver, el):
             except Exception:
                 return False
 
+PAGINATION_NEXT = [
+    "a[data-js-pagination-link][aria-label*='Siguiente']",
+    ".b-pagination-elements_list .b-next-btn a",
+    ".b-pagination-elements_next a",
+    "li.b-pagination-elements_list.b-next-btn a",
+    "a.b-pagination-elements_number[aria-label*='Siguiente']",
+    "a[rel='next']",
+]
+
 def click_next_page(driver, next_page_number):
-    # 1) enlace con data-page-number
     try:
         sel = f"a[data-js-pagination-link][data-page-number='{next_page_number}']"
         link = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
@@ -148,16 +137,14 @@ def click_next_page(driver, next_page_number):
             return True
     except TimeoutException:
         pass
-    # 2) botón Siguiente
     for sel in PAGINATION_NEXT:
         try:
             a = driver.find_element(By.CSS_SELECTOR, sel)
             if a.is_displayed() and a.is_enabled():
-                if _robust_click(driver, a): 
+                if _robust_click(driver, a):
                     return True
         except Exception:
             continue
-    # 3) ícono flecha (fallback)
     try:
         icon = driver.find_element(By.CSS_SELECTOR, "i.i-arrow-right-after")
         parent_link = icon.find_element(By.XPATH, "./ancestor::a[1]")
@@ -206,7 +193,6 @@ def _extract_img(el):
     return None
 
 def parse_tile(el, page_idx):
-    # enlace / id
     href = None
     try:
         a = el.find_element(By.CSS_SELECTOR, "a[href]")
@@ -225,10 +211,8 @@ def parse_tile(el, page_idx):
     ])
     brand = _extract_text(el, [".b-product_tile-brand h4", ".b-product_tile-brand"])
 
-    # precios
     list_p = sale_p = None
     nums = []
-
     price_block = None
     for sel in PRICE_BLOCKS:
         try:
@@ -236,7 +220,6 @@ def parse_tile(el, page_idx):
             break
         except Exception:
             continue
-
     if price_block:
         spans = price_block.find_elements(By.CSS_SELECTOR, ".b-product_price-value, [itemprop='price'], span")
         for sp in spans:
@@ -244,15 +227,22 @@ def parse_tile(el, page_idx):
             if v is not None:
                 nums.append(v)
             try:
-                if sp.find_elements(By.XPATH, f"./ancestor::*[self::{OLD_PRICE_HINT}]"):
-                    if v is not None:
-                        list_p = v
-                if sp.find_elements(By.XPATH, f"./ancestor::*[self::{SALE_PRICE_HINT}]"):
-                    if v is not None:
-                        sale_p = v
+                # viejo precio (tachado)
+                old_anc = sp.find_elements(
+                    By.XPATH,
+                    "./ancestor::*[contains(@class,'price-old') or contains(@class,'b-product_price-old')]"
+                )
+                if old_anc and v is not None:
+                    list_p = v
+                # precio de oferta
+                sale_anc = sp.find_elements(
+                    By.XPATH,
+                    "./ancestor::*[contains(@class,'price-sales') or contains(@class,'b-product_price-sales')]"
+                )
+                if sale_anc and v is not None:
+                    sale_p = v
             except Exception:
                 pass
-
     if (list_p is None or sale_p is None) and len(nums) >= 2:
         mx, mn = max(nums), min(nums)
         if list_p is None: list_p = mx
@@ -319,10 +309,8 @@ def scrape_category(url, headless=True, max_pages=50):
             time.sleep(random.uniform(0.3, 0.7))
         return rows
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        try: driver.quit()
+        except Exception: pass
 
 # ─────────── Histórico + diffs ───────────
 def _normalize_numeric(df: pd.DataFrame):
@@ -336,14 +324,20 @@ def _latest_previous_parquet(out_prefix: str, save_dir: Path) -> Path | None:
     return cand[-1] if cand else None
 
 def _compute_diffs(prev_df: pd.DataFrame | None, curr_df: pd.DataFrame):
-    key = "product_id" if "product_id" in curr_df.columns and curr_df["product_id"].notna().any() else "enlace"
+    """
+    Devuelve SIEMPRE 4 valores: (key, changes_df, new_df, removed_df)
+    - key: 'product_id' si aplica, si no 'enlace'
+    """
+    key = "product_id" if ("product_id" in curr_df.columns and curr_df["product_id"].notna().any()) else "enlace"
+
     curr = curr_df.copy()
     if key not in curr.columns:
         curr[key] = curr["enlace"].astype("string")
     curr.set_index(key, inplace=True, drop=False)
 
     if prev_df is None or prev_df.empty:
-        return key, pd.DataFrame(columns=curr.columns), curr.copy()
+        # Primer snapshot: no hay changes ni removed
+        return key, pd.DataFrame(columns=curr.columns), curr.copy(), pd.DataFrame(columns=curr.columns)
 
     prev = prev_df.copy()
     if key not in prev.columns:
@@ -354,12 +348,11 @@ def _compute_diffs(prev_df: pd.DataFrame | None, curr_df: pd.DataFrame):
     removed_idx = prev.index.difference(curr.index)
     common = curr.index.intersection(prev.index)
 
-    # changes: precio/lista/descuento distintos (tolerancia)
     tol = 0.01
     cols_to_check = [c for c in ("list_price", "sale_price", "discount_pct") if c in curr.columns and c in prev.columns]
     changed_idx = []
     for k in common:
-        diffs = []
+        diffs_ok = []
         for c in cols_to_check:
             a, b = curr.at[k, c], prev.at[k, c]
             try:
@@ -371,8 +364,8 @@ def _compute_diffs(prev_df: pd.DataFrame | None, curr_df: pd.DataFrame):
                     eq = abs(float(a) - float(b)) <= tol
             except Exception:
                 eq = (a == b)
-            diffs.append(eq)
-        if not all(diffs):
+            diffs_ok.append(eq)
+        if not all(diffs_ok):
             changed_idx.append(k)
 
     changes = curr.loc[changed_idx].copy()
@@ -386,7 +379,6 @@ def _load_alert_brands() -> set[str]:
     if not raw:
         return set()
     parts = []
-    # soporta CSV o multilínea
     for line in raw.splitlines():
         parts.extend([p.strip() for p in line.split(",")])
     return {p for p in (s.strip() for s in parts) if p}
@@ -420,8 +412,7 @@ def _send_email(subject: str, body: str, attachments: list[tuple[str, bytes, str
     pwd  = os.environ.get("EMAIL_PASS", "")
     to   = os.environ.get("EMAIL_TO", "")
     if not (host and port and user and pwd and to):
-        dbg = _env_bool("EMAIL_DEBUG", False)
-        if dbg:
+        if _env_bool("EMAIL_DEBUG", False):
             print("⚠️ EMAIL_* incompletos: no se envía correo.")
         return
     rec = [x.strip() for x in re.split(r"[;,]", to) if x.strip()]
@@ -438,7 +429,7 @@ def _send_email(subject: str, body: str, attachments: list[tuple[str, bytes, str
         s.send_message(msg, from_addr=user, to_addrs=rec)
     print("📧 Alerta enviada:", subject)
 
-# ─────────── XLSX ───────────
+# ─────────── XLSX y Parquet ───────────
 def save_xlsx(df: pd.DataFrame, out_prefix: str, save_dir: Path) -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"{out_prefix}_snapshot_{stamp}.xlsx"
@@ -477,7 +468,6 @@ def run_one(url: str, out_prefix: str, headless: bool, max_pages: int, save_dir:
     if "product_id" in df.columns: df["product_id"] = df["product_id"].astype("string")
     if "sku" in df.columns: df["sku"] = df["sku"].astype("string")
 
-    # leer previo
     prev_pq = _latest_previous_parquet(out_prefix, save_dir)
     prev_df = None
     if prev_pq and prev_pq.exists():
@@ -490,7 +480,7 @@ def run_one(url: str, out_prefix: str, headless: bool, max_pages: int, save_dir:
         except Exception as e:
             print(f"⚠️ No pude leer previo {prev_pq.name}: {e}")
 
-    # diffs
+    # diffs SIEMPRE 4 valores
     key, changes_df, new_df, removed_df = _compute_diffs(prev_df, df)
 
     # alertas por marca con descuento
@@ -498,38 +488,31 @@ def run_one(url: str, out_prefix: str, headless: bool, max_pages: int, save_dir:
     min_disc = float(os.environ.get("ALERT_MIN_DISC", "30"))
     hits_new = _filter_alert_hits_new(new_df, min_disc, brands)
     hits_changes = _filter_alert_hits_changes(changes_df, min_disc, brands)
-
     if (hits_new is not None and not hits_new.empty) or (hits_changes is not None and not hits_changes.empty):
-        # armar adjuntos mini
         atts = []
         if hits_new is not None and not hits_new.empty:
-            bio = io.BytesIO()
-            hits_new.to_excel(bio, index=False)
+            bio = io.BytesIO(); hits_new.to_excel(bio, index=False)
             atts.append((f"{out_prefix}_ALERT_NEW.xlsx", bio.getvalue(),
                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
         if hits_changes is not None and not hits_changes.empty:
-            bio = io.BytesIO()
-            hits_changes.to_excel(bio, index=False)
+            bio = io.BytesIO(); hits_changes.to_excel(bio, index=False)
             atts.append((f"{out_prefix}_ALERT_CHANGES.xlsx", bio.getvalue(),
                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
-
-        body = (f"Categoría/URL: {url}\n"
-                f"Prefijo: {out_prefix}\n"
-                f"Umbral descuento: {min_disc}%\n"
-                f"Marcas filtradas: {', '.join(sorted(brands)) or '(todas)'}\n"
-                f"NEW >= {min_disc}%: {0 if hits_new is None else len(hits_new)}\n"
-                f"CHANGES >= {min_disc}%: {0 if hits_changes is None else len(hits_changes)}\n")
+        body = (f"URL: {url}\nPrefijo: {out_prefix}\nUmbral: {min_disc}%\n"
+                f"Marcas: {', '.join(sorted(brands)) or '(todas)'}\n"
+                f"NEW: {0 if hits_new is None else len(hits_new)} | "
+                f"CHANGES: {0 if hits_changes is None else len(hits_changes)}")
         _send_email(f"[Scraper] Alertas {out_prefix}", body, atts)
 
-    # persistencia
     xlsx_path = save_xlsx(df, out_prefix, save_dir)
     pq_path   = save_parquet(df, out_prefix, save_dir)
 
-    # resumen consola
     big51 = int(df.get("discount_pct", pd.Series(dtype=float)).fillna(0).ge(51).sum())
     print(f"🔢 Filas: {len(df)} | ≥51%: {big51}")
     print(f"Último previo: {prev_pq.name if prev_pq else '—'}")
-    print(f"NEW={len(new_df)} CHANGES={len(changes_df)} REMOVED={len(removed_df)}")
+    print(f"NEW={0 if new_df is None else len(new_df)} "
+          f"CHANGES={0 if changes_df is None else len(changes_df)} "
+          f"REMOVED={0 if removed_df is None else len(removed_df)}")
     return df, xlsx_path, pq_path
 
 # ─────────── CLI manual ───────────
@@ -572,7 +555,6 @@ if __name__ == "__main__":
         max_pages = 50
     out_prefix = os.environ.get("OUT_PREFIX", f"palacio_{cat_key}")
 
-    # permite override por prompt
     hp = input(f"Headless? [Y/n] (actual={headless}): ").strip().lower()
     if hp in ("n", "no", "0"): headless = False
     mp = input(f"Max pages? (actual={max_pages}): ").strip()
