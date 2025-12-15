@@ -1,9 +1,12 @@
-requests
-pandas
-beautifulsoup4
-xlsxwriter
 urllib3>=2.0.0
 selenium>=4.25.0
 webdriver-manager>=4.0.2
 pyarrow
 tenacity==8.2.3
+pandas==2.2.3
+xlsxwriter==3.2.0
+openpyxl==3.1.5
+selenium==4.26.1
+tenacity==9.0.0
+beautifulsoup4==4.12.3
+requests==2.32.3
