@@ -6,3 +6,4 @@ urllib3>=2.0.0
 selenium>=4.25.0
 webdriver-manager>=4.0.2
 pyarrow
+tenacity==8.2.3
