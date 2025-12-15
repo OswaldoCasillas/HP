@@ -1,566 +1,718 @@
-# -*- coding: utf-8 -*-
-# ──────────────────────────────────────────────────────────────────────────────
-# Palacio de Hierro – Runner MANUAL (elige categoría o URL) con Selenium
-# - PLP nueva: selectores robustos (tiles/precios/paginación)
-# - Histórico .parquet + diffs
-# - Alertas por marca (NEW/CHANGES con descuento ≥ ALERT_MIN_DISC) -> email
-# - Genera XLSX (hoja SNAPSHOT)
-# Reqs: selenium webdriver-manager pandas xlsxwriter openpyxl
-# Env opcional: SAVE_DIR, EMAIL_*, PALACIO_ALERT_BRANDS, ALERT_MIN_DISC
-# ──────────────────────────────────────────────────────────────────────────────
+# palacio_manual_runner_selenium_v2.py
+from __future__ import annotations
 
-import os, re, time, random, smtplib, io
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import smtplib
+import sys
+from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
-from datetime import datetime, timezone
-import pandas as pd
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
 
-# Selenium
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from tenacity import retry, stop_after_attempt, wait_fixed
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.common.exceptions import (
-    TimeoutException, StaleElementReferenceException,
-    ElementClickInterceptedException
-)
-from webdriver_manager.chrome import ChromeDriverManager
 
-# ───────────── Config ─────────────
-WAIT = 25
-SCROLL_STEP = 700
-SCROLL_ROUNDS = 2
-UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
-]
 
-LIST_SELECTORS = [
-    "article.b-product_tile_item",
-    "div.b-product_tile[data-component='search/ProductTile']",
-    "div.b-product_tile",
-    "div.b-product",
-    "li.product",
-    "div.product-tile",
-]
+# -----------------------------
+# Helpers
+# -----------------------------
+def _now_cdmx_iso() -> str:
+    # runner suele estar en UTC; esto es solo “timestamp de ejecución”
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-PRICE_BLOCKS = [
-    ".b-product_tile-price", ".b-product_price",
-    ".b-product_tile .b-product_price", ".product-pricing"
-]
 
-_money_clean = re.compile(r"[^\d.,]")
-def parse_price(txt):
-    if not txt:
+def _to_bool(x: str) -> bool:
+    return str(x).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _slug(s: str, max_len: int = 60) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"https?://", "", s)
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return (s[:max_len]).strip("-") if s else "site"
+
+
+def _safe_float(x) -> Optional[float]:
+    if x is None:
         return None
-    s = _money_clean.sub("", txt).strip().replace(",", "")
     try:
-        return float(s)
-    except ValueError:
+        return float(x)
+    except Exception:
         return None
 
-def _env_bool(name, default=False):
-    v = os.environ.get(name, "")
-    if v == "":
-        return default
-    return v.lower() not in ("0", "false", "no")
 
-def setup_driver(headless=True):
-    co = ChromeOptions()
+def _pct_discount(list_price: Optional[float], sale_price: Optional[float]) -> Optional[float]:
+    if list_price is None or sale_price is None:
+        return None
+    if list_price <= 0:
+        return None
+    return round((list_price - sale_price) / list_price * 100.0, 2)
+
+
+def _read_lines_env(name: str) -> List[str]:
+    raw = os.getenv(name, "") or ""
+    # admite newline, coma o punto y coma
+    parts = []
+    for chunk in re.split(r"[\n,;]+", raw):
+        c = chunk.strip()
+        if c:
+            parts.append(c)
+    return parts
+
+
+def _normalize_brand(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).upper()
+
+
+# -----------------------------
+# Category discovery (from homepage menu)
+# -----------------------------
+@dataclass
+class CategoryLink:
+    label: str
+    url: str
+    level: int
+
+
+def discover_from_home(home_url: str = "https://www.elpalaciodehierro.com/") -> List[CategoryLink]:
+    """
+    Extrae links del menú usando clases b-categories_navigation-link_1/2/3 (se ven en tu HTML home).
+    Ejemplos: HOMBRE, y subcategorías como /hombre/ropa/playeras-moda/ etc. :contentReference[oaicite:5]{index=5}
+    """
+    r = requests.get(home_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+
+    out: List[CategoryLink] = []
+    for lvl in (1, 2, 3):
+        for a in soup.select(f"a.b-categories_navigation-link_{lvl}[href]"):
+            href = a.get("href", "").strip()
+            if not href:
+                continue
+            # normaliza a URL absoluta
+            if href.startswith("/"):
+                href = urljoin(home_url, href)
+            label = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+            if label:
+                out.append(CategoryLink(label=label, url=href, level=lvl))
+
+    # de-dup conservando orden
+    seen = set()
+    uniq = []
+    for x in out:
+        key = (x.level, x.url)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(x)
+    return uniq
+
+
+# -----------------------------
+# Pagination by URL (?params={"page":N})
+# -----------------------------
+def build_page_url(base_url: str, page: int) -> str:
+    """
+    Palacio usa paginación via ?params=%7B%22page%22%3A2%7D ... :contentReference[oaicite:6]{index=6}
+    Si base_url ya trae params, lo reemplaza; si no, lo agrega.
+    """
+    if page <= 1:
+        return base_url
+
+    u = urlparse(base_url)
+    qs = parse_qs(u.query, keep_blank_values=True)
+
+    params_raw = None
+    if "params" in qs and qs["params"]:
+        params_raw = qs["params"][0]
+
+    params_obj = {}
+    if params_raw:
+        # viene como JSON string o URL-encoded; parse_qs ya lo decodifica
+        try:
+            params_obj = json.loads(params_raw)
+        except Exception:
+            params_obj = {}
+
+    params_obj["page"] = page
+    qs["params"] = [json.dumps(params_obj, separators=(",", ":"))]
+
+    new_query = urlencode(qs, doseq=True)
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
+
+
+# -----------------------------
+# Selenium setup
+# -----------------------------
+def make_driver(headless: bool = True) -> webdriver.Chrome:
+    opts = ChromeOptions()
     if headless:
-        co.add_argument("--headless=new")
-    co.add_argument("--disable-gpu")
-    co.add_argument("--window-size=1366,900")
-    co.add_argument("--disable-dev-shm-usage")
-    co.add_argument("--no-sandbox")
-    co.add_argument("--lang=es-MX")
-    co.add_argument("--disable-blink-features=AutomationControlled")
-    co.add_argument(f"--user-agent={random.choice(UA_LIST)}")
-    co.add_argument("--disable-background-timer-throttling")
-    co.add_argument("--disable-renderer-backgrounding")
-    co.add_argument("--disable-backgrounding-occluded-windows")
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=co)
-    driver.set_page_load_timeout(60)
-    return driver
+        # headless “new” suele evitar el SessionNotCreated típico en GH
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1400,900")
+    opts.add_argument("--lang=es-MX")
+    # evita logs ruidosos
+    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
+    return webdriver.Chrome(options=opts)
 
-def wait_grid(driver):
-    css = ", ".join(LIST_SELECTORS)
-    WebDriverWait(driver, WAIT).until(lambda d: len(d.find_elements(By.CSS_SELECTOR, css)) > 0)
 
-def current_tiles(driver):
-    css = ", ".join(LIST_SELECTORS)
-    return driver.find_elements(By.CSS_SELECTOR, css)
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+def wait_for_plp(driver: webdriver.Chrome, timeout: int = 25) -> None:
+    """
+    Espera a que aparezcan productos (tiles).
+    En tu HTML PLP se ven artículos l-plp-grid_item m-product. :contentReference[oaicite:7]{index=7}
+    """
+    w = WebDriverWait(driver, timeout)
+    w.until(
+        EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "article.l-plp-grid_item.m-product, article.b-product_tile_item")
+        )
+    )
 
-def gentle_scroll(driver, rounds=SCROLL_ROUNDS):
-    for _ in range(rounds):
-        driver.execute_script(f"window.scrollBy(0, {SCROLL_STEP});")
-        time.sleep(0.25)
-        driver.execute_script("window.scrollBy(0, -200);")
-        time.sleep(0.25)
 
-def _robust_click(driver, el):
+def gentle_scroll(driver: webdriver.Chrome, steps: int = 4) -> None:
+    # ayuda a cargar lazy content (si aplica)
     try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.05)
-        el.click()
-        return True
-    except (ElementClickInterceptedException, StaleElementReferenceException):
-        try:
-            ActionChains(driver).move_to_element(el).pause(0.05).click().perform()
-            return True
-        except Exception:
-            try:
-                driver.execute_script("arguments[0].click();", el)
-                return True
-            except Exception:
-                return False
-
-PAGINATION_NEXT = [
-    "a[data-js-pagination-link][aria-label*='Siguiente']",
-    ".b-pagination-elements_list .b-next-btn a",
-    ".b-pagination-elements_next a",
-    "li.b-pagination-elements_list.b-next-btn a",
-    "a.b-pagination-elements_number[aria-label*='Siguiente']",
-    "a[rel='next']",
-]
-
-def click_next_page(driver, next_page_number):
-    try:
-        sel = f"a[data-js-pagination-link][data-page-number='{next_page_number}']"
-        link = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-        if _robust_click(driver, link):
-            return True
-    except TimeoutException:
-        pass
-    for sel in PAGINATION_NEXT:
-        try:
-            a = driver.find_element(By.CSS_SELECTOR, sel)
-            if a.is_displayed() and a.is_enabled():
-                if _robust_click(driver, a):
-                    return True
-        except Exception:
-            continue
-    try:
-        icon = driver.find_element(By.CSS_SELECTOR, "i.i-arrow-right-after")
-        parent_link = icon.find_element(By.XPATH, "./ancestor::a[1]")
-        if parent_link and _robust_click(driver, parent_link):
-            return True
+        h = driver.execute_script("return document.body.scrollHeight") or 0
+        for i in range(1, steps + 1):
+            y = int(h * i / (steps + 1))
+            driver.execute_script("window.scrollTo(0, arguments[0]);", y)
     except Exception:
         pass
-    return False
 
-def wait_page_changed(driver, prev_count, timeout=WAIT):
-    start = time.time()
-    prev_url = driver.current_url
-    css = ", ".join(LIST_SELECTORS)
-    while time.time() - start < timeout:
-        time.sleep(0.25)
-        if driver.current_url != prev_url:
-            return True
-        try:
-            curr = len(driver.find_elements(By.CSS_SELECTOR, css))
-            if curr != prev_count and curr > 0:
-                return True
-        except Exception:
-            pass
-    return False
 
-def _extract_text(el, selectors):
-    for sel in selectors:
-        try:
-            node = el.find_element(By.CSS_SELECTOR, sel)
-            t = (node.text or "").strip()
-            if t:
-                return t
-        except Exception:
-            continue
-    return None
+# -----------------------------
+# Product extraction (robust via data-analytics)
+# -----------------------------
+def extract_product_from_article(article) -> Dict:
+    """
+    En cada item hay un .b-product con data-analytics JSON (id/name/brand/price/metric1...). :contentReference[oaicite:8]{index=8}
+    También hay markup de precios old/sales. :contentReference[oaicite:9]{index=9}
+    """
+    out: Dict = {}
 
-def _extract_img(el):
-    for sel in ["img[data-js-product-image]", "img.b-product_image", "picture img", "img"]:
-        try:
-            img_el = el.find_element(By.CSS_SELECTOR, sel)
-            src = img_el.get_attribute("src") or img_el.get_attribute("data-src")
-            if src and src.startswith("http"):
-                return src
-        except Exception:
-            continue
-    return None
-
-def parse_tile(el, page_idx):
-    href = None
+    # 1) data-analytics
+    pdata = {}
     try:
-        a = el.find_element(By.CSS_SELECTOR, "a[href]")
-        href = a.get_attribute("href")
+        prod = article.find_element(By.CSS_SELECTOR, ".b-product[data-analytics]")
+        da = prod.get_attribute("data-analytics") or ""
+        if da:
+            pdata = json.loads(da).get("product", {}) or {}
+        out["product_id"] = prod.get_attribute("data-pid") or pdata.get("id")
     except Exception:
-        pass
-    pid = None
-    if href:
-        m = re.search(r"/(\d{5,})", href)
-        if m:
-            pid = m.group(1)
+        out["product_id"] = None
 
-    name = _extract_text(el, [
-        ".b-product_tile-name h4", ".b-product_tile-title",
-        ".b-product_tile-name", "h3.b-product_tile-name"
-    ])
-    brand = _extract_text(el, [".b-product_tile-brand h4", ".b-product_tile-brand"])
+    out["brand"] = pdata.get("brand")
+    out["name"] = pdata.get("name")
+    out["category"] = pdata.get("category") or pdata.get("departmentName")
+    out["department_id"] = pdata.get("departmentID")
+    out["department_name"] = pdata.get("departmentName")
 
-    list_p = sale_p = None
-    nums = []
-    price_block = None
-    for sel in PRICE_BLOCKS:
-        try:
-            price_block = el.find_element(By.CSS_SELECTOR, sel)
-            break
-        except Exception:
-            continue
-    if price_block:
-        spans = price_block.find_elements(By.CSS_SELECTOR, ".b-product_price-value, [itemprop='price'], span")
-        for sp in spans:
-            v = parse_price(sp.get_attribute("content") or sp.text)
-            if v is not None:
-                nums.append(v)
-            try:
-                # viejo precio (tachado)
-                old_anc = sp.find_elements(
-                    By.XPATH,
-                    "./ancestor::*[contains(@class,'price-old') or contains(@class,'b-product_price-old')]"
-                )
-                if old_anc and v is not None:
-                    list_p = v
-                # precio de oferta
-                sale_anc = sp.find_elements(
-                    By.XPATH,
-                    "./ancestor::*[contains(@class,'price-sales') or contains(@class,'b-product_price-sales')]"
-                )
-                if sale_anc and v is not None:
-                    sale_p = v
-            except Exception:
-                pass
-    if (list_p is None or sale_p is None) and len(nums) >= 2:
-        mx, mn = max(nums), min(nums)
-        if list_p is None: list_p = mx
-        if sale_p is None: sale_p = mn
-    if list_p is None and sale_p is None and len(nums) == 1:
-        list_p = sale_p = nums[0]
+    # precios “preferidos” desde analytics
+    out["sale_price"] = _safe_float(pdata.get("price"))
+    out["list_price"] = _safe_float(pdata.get("metric1"))
 
-    discount = None
-    if list_p and sale_p and sale_p < list_p:
-        discount = round((1 - (sale_p / list_p)) * 100, 2)
-
-    return {
-        "product_id": pid,
-        "sku": pid,
-        "name": name,
-        "brand": brand,
-        "price_currency": "MXN",
-        "list_price": list_p,
-        "sale_price": sale_p,
-        "discount_pct": discount,
-        "image_url": _extract_img(el),
-        "enlace": href,
-        "page_idx": page_idx,
-        "captured_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-    }
-
-def scrape_category(url, headless=True, max_pages=50):
-    driver = setup_driver(headless=headless)
-    rows, seen = [], set()
+    # 2) fallback: leer del DOM
     try:
-        print(f"Abriendo: {url}")
-        driver.get(url)
-        wait_grid(driver)
+        tile = article.find_element(By.CSS_SELECTOR, ".b-product_tile")
+    except Exception:
+        tile = article
 
-        page = 1
-        while page <= max_pages:
-            print(f"— Página {page} —")
-            wait_grid(driver)
-            gentle_scroll(driver, rounds=SCROLL_ROUNDS)
+    if not out.get("brand"):
+        try:
+            out["brand"] = tile.find_element(By.CSS_SELECTOR, ".b-product_tile-brand").text.strip()
+        except Exception:
+            out["brand"] = None
 
-            tiles = current_tiles(driver)
-            print(f"   tiles={len(tiles)}")
-            new_here = 0
-            for t in tiles:
-                try:
-                    data = parse_tile(t, page)
-                    key = data.get("product_id") or data.get("enlace")
-                    if key and key not in seen:
-                        seen.add(key)
-                        rows.append(data)
-                        new_here += 1
-                except Exception:
-                    continue
-            print(f"   nuevos={new_here}")
+    if not out.get("name"):
+        try:
+            out["name"] = tile.find_element(By.CSS_SELECTOR, ".b-product_tile-name").text.strip()
+        except Exception:
+            out["name"] = None
 
-            prev_cnt = len(tiles)
-            moved = click_next_page(driver, page + 1)
-            if not moved:
-                print("   (No hay más paginación visible)")
+    # URL producto
+    out["url"] = None
+    for sel in ("a[data-js-product-tile-name]", "a.b-product_tile-image", "h3.b-product_tile-name a", "a[href*='/p/']"):
+        try:
+            a = tile.find_element(By.CSS_SELECTOR, sel)
+            href = a.get_attribute("href")
+            if href:
+                out["url"] = href
                 break
-            if not wait_page_changed(driver, prev_cnt, timeout=WAIT):
-                time.sleep(1.0)
-            page += 1
-            time.sleep(random.uniform(0.3, 0.7))
-        return rows
-    finally:
-        try: driver.quit()
-        except Exception: pass
+        except Exception:
+            continue
 
-# ─────────── Histórico + diffs ───────────
-def _normalize_numeric(df: pd.DataFrame):
-    for col in ("list_price", "sale_price", "discount_pct"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # badge promo
+    try:
+        out["promo"] = tile.find_element(By.CSS_SELECTOR, ".b-product_tile-badge_promo").text.strip()
+    except Exception:
+        out["promo"] = None
 
-def _latest_previous_parquet(out_prefix: str, save_dir: Path) -> Path | None:
-    patt = f"{out_prefix}_snapshot_*.parquet"
-    cand = sorted(save_dir.glob(patt))
-    return cand[-1] if cand else None
+    # DOM prices fallback (content suele venir en .b-product_price-value) :contentReference[oaicite:10]{index=10}
+    def _dom_price(css: str) -> Optional[float]:
+        try:
+            el = tile.find_element(By.CSS_SELECTOR, css)
+            val = el.get_attribute("content") or el.text
+            val = (val or "").replace("$", "").replace(",", "").strip()
+            return _safe_float(re.sub(r"[^\d.]", "", val))
+        except Exception:
+            return None
 
-def _compute_diffs(prev_df: pd.DataFrame | None, curr_df: pd.DataFrame):
+    if out.get("list_price") is None:
+        out["list_price"] = _dom_price(".b-product_price-old .b-product_price-value")
+
+    if out.get("sale_price") is None:
+        out["sale_price"] = _dom_price(".b-product_price-sales .b-product_price-value")
+
+    out["brand"] = _normalize_brand(out.get("brand") or "")
+    out["product_id"] = str(out["product_id"]) if out.get("product_id") is not None else None
+    return out
+
+
+def scrape_category(
+    driver: webdriver.Chrome,
+    base_url: str,
+    max_pages: int,
+    stop_after_empty: int = 1,
+    scroll_steps: int = 4,
+) -> pd.DataFrame:
+    all_rows: List[Dict] = []
+    seen_keys = set()
+
+    empty_streak = 0
+    run_ts = _now_cdmx_iso()
+
+    for page in range(1, max_pages + 1):
+        page_url = build_page_url(base_url, page)
+        driver.get(page_url)
+        wait_for_plp(driver)
+        gentle_scroll(driver, steps=scroll_steps)
+
+        articles = driver.find_elements(By.CSS_SELECTOR, "article.l-plp-grid_item.m-product, article.b-product_tile_item")
+        page_rows = []
+
+        for art in articles:
+            try:
+                row = extract_product_from_article(art)
+            except Exception:
+                continue
+
+            row["page"] = page
+            row["page_url"] = page_url
+            row["run_ts"] = run_ts
+
+            key = row.get("product_id") or row.get("url")
+            if key and key not in seen_keys:
+                seen_keys.add(key)
+                page_rows.append(row)
+
+        if not page_rows:
+            empty_streak += 1
+        else:
+            empty_streak = 0
+            all_rows.extend(page_rows)
+
+        if empty_streak >= stop_after_empty:
+            break
+
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        return df
+
+    # numerics + discount
+    df["list_price"] = pd.to_numeric(df["list_price"], errors="coerce")
+    df["sale_price"] = pd.to_numeric(df["sale_price"], errors="coerce")
+    df["discount_pct"] = df.apply(lambda r: _pct_discount(r["list_price"], r["sale_price"]), axis=1)
+
+    # limpia nulos “vacíos”
+    df.replace({"": None}, inplace=True)
+    return df
+
+
+# -----------------------------
+# Diffs
+# -----------------------------
+def _latest_snapshot(history_dir: Path, prefix: str) -> Optional[Path]:
+    if not history_dir.exists():
+        return None
+    pats = list(history_dir.glob(f"{prefix}_snapshot_*.parquet"))
+    if not pats:
+        return None
+    pats.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return pats[0]
+
+
+def compute_diffs(
+    prev_df: Optional[pd.DataFrame],
+    cur_df: pd.DataFrame,
+    key_col: str = "product_id",
+    compare_cols: Tuple[str, ...] = ("list_price", "sale_price", "discount_pct", "promo"),
+) -> Tuple[str, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Devuelve SIEMPRE 4 valores: (key, changes_df, new_df, removed_df)
-    - key: 'product_id' si aplica, si no 'enlace'
+    REGRESA SIEMPRE 4: (key_col, changes_df, new_df, removed_df)
     """
-    key = "product_id" if ("product_id" in curr_df.columns and curr_df["product_id"].notna().any()) else "enlace"
+    if cur_df is None or cur_df.empty:
+        empty = pd.DataFrame()
+        return key_col, empty, empty, empty
 
-    curr = curr_df.copy()
-    if key not in curr.columns:
-        curr[key] = curr["enlace"].astype("string")
-    curr.set_index(key, inplace=True, drop=False)
+    cur = cur_df.copy()
+    cur_key = key_col if key_col in cur.columns else ("url" if "url" in cur.columns else cur.columns[0])
+    cur[cur_key] = cur[cur_key].astype(str)
 
     if prev_df is None or prev_df.empty:
-        # Primer snapshot: no hay changes ni removed
-        return key, pd.DataFrame(columns=curr.columns), curr.copy(), pd.DataFrame(columns=curr.columns)
+        return cur_key, pd.DataFrame(), cur, pd.DataFrame()
 
     prev = prev_df.copy()
-    if key not in prev.columns:
-        prev[key] = prev["enlace"].astype("string")
-    prev.set_index(key, inplace=True, drop=False)
+    if cur_key not in prev.columns:
+        # si antes venía con url como key, cae ahí
+        alt = "url" if "url" in prev.columns else None
+        if alt:
+            cur_key = alt
+        else:
+            return cur_key, pd.DataFrame(), cur, pd.DataFrame()
 
-    new_idx = curr.index.difference(prev.index)
-    removed_idx = prev.index.difference(curr.index)
-    common = curr.index.intersection(prev.index)
+    prev[cur_key] = prev[cur_key].astype(str)
 
-    tol = 0.01
-    cols_to_check = [c for c in ("list_price", "sale_price", "discount_pct") if c in curr.columns and c in prev.columns]
-    changed_idx = []
-    for k in common:
-        diffs_ok = []
-        for c in cols_to_check:
-            a, b = curr.at[k, c], prev.at[k, c]
-            try:
+    # NEW / REMOVED
+    cur_keys = set(cur[cur_key].dropna())
+    prev_keys = set(prev[cur_key].dropna())
+
+    new_keys = cur_keys - prev_keys
+    removed_keys = prev_keys - cur_keys
+
+    new_df = cur[cur[cur_key].isin(new_keys)].copy()
+    removed_df = prev[prev[cur_key].isin(removed_keys)].copy()
+
+    # CHANGED (join)
+    common_prev = prev[prev[cur_key].isin(cur_keys)].copy()
+    common_cur = cur[cur[cur_key].isin(prev_keys)].copy()
+
+    merged = common_cur.merge(
+        common_prev[[cur_key, *compare_cols]],
+        on=cur_key,
+        how="left",
+        suffixes=("", "_prev"),
+    )
+
+    changed_rows = []
+    for _, r in merged.iterrows():
+        changed_fields = []
+        for c in compare_cols:
+            a = r.get(c)
+            b = r.get(f"{c}_prev")
+            # floats: tolerancia
+            if isinstance(a, (int, float)) or isinstance(b, (int, float)):
                 if pd.isna(a) and pd.isna(b):
-                    eq = True
-                elif pd.isna(a) != pd.isna(b):
-                    eq = False
+                    continue
+                if (pd.isna(a) and not pd.isna(b)) or (not pd.isna(a) and pd.isna(b)):
+                    changed_fields.append(c)
                 else:
-                    eq = abs(float(a) - float(b)) <= tol
+                    if abs(float(a) - float(b)) > 1e-6:
+                        changed_fields.append(c)
+            else:
+                if (a or None) != (b or None):
+                    changed_fields.append(c)
+
+        if changed_fields:
+            row = r.to_dict()
+            row["changed_fields"] = ", ".join(changed_fields)
+            changed_rows.append(row)
+
+    changes_df = pd.DataFrame(changed_rows)
+    return cur_key, changes_df, new_df, removed_df
+
+
+# -----------------------------
+# Outputs
+# -----------------------------
+def write_outputs(
+    out_dir: Path,
+    prefix: str,
+    cur_df: pd.DataFrame,
+    key_col: str,
+    changes_df: pd.DataFrame,
+    new_df: pd.DataFrame,
+    removed_df: pd.DataFrame,
+) -> Tuple[Path, Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    xlsx_path = out_dir / f"{prefix}_report_{ts}.xlsx"
+    snap_path = out_dir / f"{prefix}_snapshot_{ts}.parquet"
+
+    # summary
+    summary = pd.DataFrame(
+        [{
+            "prefix": prefix,
+            "run_ts": _now_cdmx_iso(),
+            "key_col": key_col,
+            "snapshot_rows": int(len(cur_df)),
+            "new_rows": int(len(new_df)),
+            "changed_rows": int(len(changes_df)),
+            "removed_rows": int(len(removed_df)),
+        }]
+    )
+
+    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+        cur_df.to_excel(writer, sheet_name="snapshot", index=False)
+        summary.to_excel(writer, sheet_name="summary", index=False)
+        new_df.to_excel(writer, sheet_name="new_items", index=False)
+        changes_df.to_excel(writer, sheet_name="changed_items", index=False)
+        removed_df.to_excel(writer, sheet_name="removed_items", index=False)
+
+        # formato básico
+        wb = writer.book
+        fmt_money = wb.add_format({"num_format": "$#,##0.00"})
+        fmt_pct = wb.add_format({"num_format": "0.00"})
+
+        for sh in ["snapshot", "new_items", "changed_items", "removed_items"]:
+            ws = writer.sheets.get(sh)
+            if not ws:
+                continue
+            # auto width simple
+            try:
+                df = {"snapshot": cur_df, "new_items": new_df, "changed_items": changes_df, "removed_items": removed_df}[sh]
+                for i, col in enumerate(df.columns):
+                    w = min(max(10, int(df[col].astype(str).str.len().fillna(0).max()) + 2), 60)
+                    ws.set_column(i, i, w)
+                if "list_price" in df.columns:
+                    ws.set_column(df.columns.get_loc("list_price"), df.columns.get_loc("list_price"), 14, fmt_money)
+                if "sale_price" in df.columns:
+                    ws.set_column(df.columns.get_loc("sale_price"), df.columns.get_loc("sale_price"), 14, fmt_money)
+                if "discount_pct" in df.columns:
+                    ws.set_column(df.columns.get_loc("discount_pct"), df.columns.get_loc("discount_pct"), 12, fmt_pct)
             except Exception:
-                eq = (a == b)
-            diffs_ok.append(eq)
-        if not all(diffs_ok):
-            changed_idx.append(k)
+                pass
 
-    changes = curr.loc[changed_idx].copy()
-    new = curr.loc[new_idx].copy()
-    removed = prev.loc[removed_idx].copy()
-    return key, changes, new, removed
+    cur_df.to_parquet(snap_path, index=False)
+    return xlsx_path, snap_path
 
-# ─────────── Alertas por marca (email) ───────────
-def _load_alert_brands() -> set[str]:
-    raw = os.environ.get("PALACIO_ALERT_BRANDS", "")
-    if not raw:
-        return set()
-    parts = []
-    for line in raw.splitlines():
-        parts.extend([p.strip() for p in line.split(",")])
-    return {p for p in (s.strip() for s in parts) if p}
 
-def _filter_alert_hits_new(new_df: pd.DataFrame, min_disc: float, brands: set[str]) -> pd.DataFrame:
-    if new_df is None or new_df.empty:
-        return new_df
-    df = new_df.copy()
-    if "discount_pct" in df.columns:
-        df["discount_pct"] = pd.to_numeric(df["discount_pct"], errors="coerce")
-        df = df[df["discount_pct"].fillna(0) >= float(min_disc)]
-    if "brand" in df.columns and brands:
-        df = df[df["brand"].fillna("").isin(brands)]
-    return df
+# -----------------------------
+# Email alerts
+# -----------------------------
+def send_email(
+    subject: str,
+    html_body: str,
+    attachments: Optional[List[Path]] = None,
+) -> None:
+    host = os.getenv("SMTP_HOST", "")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER", "")
+    pwd = os.getenv("SMTP_PASS", "")
+    to = os.getenv("EMAIL_TO", "")
 
-def _filter_alert_hits_changes(chg_df: pd.DataFrame, min_disc: float, brands: set[str]) -> pd.DataFrame:
-    if chg_df is None or chg_df.empty:
-        return chg_df
-    df = chg_df.copy()
-    if "discount_pct" in df.columns:
-        df["discount_pct"] = pd.to_numeric(df["discount_pct"], errors="coerce")
-        df = df[df["discount_pct"].fillna(0) >= float(min_disc)]
-    if "brand" in df.columns and brands:
-        df = df[df["brand"].fillna("").isin(brands)]
-    return df
-
-def _send_email(subject: str, body: str, attachments: list[tuple[str, bytes, str]] | None = None):
-    host = os.environ.get("EMAIL_HOST", "")
-    port = int(os.environ.get("EMAIL_PORT", "587"))
-    user = os.environ.get("EMAIL_USER", "")
-    pwd  = os.environ.get("EMAIL_PASS", "")
-    to   = os.environ.get("EMAIL_TO", "")
-    if not (host and port and user and pwd and to):
-        if _env_bool("EMAIL_DEBUG", False):
-            print("⚠️ EMAIL_* incompletos: no se envía correo.")
+    if not (host and user and pwd and to):
+        print("[email] SMTP_* o EMAIL_TO no configurados; skip.")
         return
-    rec = [x.strip() for x in re.split(r"[;,]", to) if x.strip()]
+
     msg = EmailMessage()
-    msg["From"] = user
-    msg["To"] = ",".join(rec)
     msg["Subject"] = subject
-    msg.set_content(body)
-    for (name, data, mime) in (attachments or []):
-        mt, st = (mime.split("/", 1) if mime else ("application", "octet-stream"))
-        msg.add_attachment(data, maintype=mt, subtype=st, filename=name)
+    msg["From"] = user
+    msg["To"] = to
+    msg.set_content("Tu cliente de correo no soporta HTML.")
+    msg.add_alternative(html_body, subtype="html")
+
+    for p in attachments or []:
+        if not p.exists():
+            continue
+        data = p.read_bytes()
+        msg.add_attachment(
+            data,
+            maintype="application",
+            subtype="octet-stream",
+            filename=p.name,
+        )
+
     with smtplib.SMTP(host, port) as s:
-        s.ehlo(); s.starttls(); s.ehlo(); s.login(user, pwd)
-        s.send_message(msg, from_addr=user, to_addrs=rec)
-    print("📧 Alerta enviada:", subject)
+        s.starttls()
+        s.login(user, pwd)
+        s.send_message(msg)
 
-# ─────────── XLSX y Parquet ───────────
-def save_xlsx(df: pd.DataFrame, out_prefix: str, save_dir: Path) -> str:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"{out_prefix}_snapshot_{stamp}.xlsx"
-    fpath = save_dir / fname
-    with pd.ExcelWriter(fpath, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="SNAPSHOT")
-        wb = writer.book; ws = writer.sheets["SNAPSHOT"]
-        money = wb.add_format({"num_format": "#,##0.00"})
-        pct   = wb.add_format({'num_format': '0.00"%"'})
-        cols = list(df.columns)
-        ws.set_column(0, len(cols)-1, 18)
-        for c in ("list_price", "sale_price"):
-            if c in cols:
-                idx = cols.index(c); ws.set_column(idx, idx, 14, money)
-        if "discount_pct" in cols:
-            idx = cols.index("discount_pct"); ws.set_column(idx, idx, 12, pct)
-        ws.autofilter(0, 0, len(df), len(cols)-1); ws.freeze_panes(1, 0)
-    print(f"📄 Guardado: {fpath}")
-    return str(fpath)
 
-def save_parquet(df: pd.DataFrame, out_prefix: str, save_dir: Path) -> str:
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"{out_prefix}_snapshot_{stamp}.parquet"
-    fpath = save_dir / fname
-    df.to_parquet(fpath, index=False)
-    print(f"🧱 Parquet: {fpath}")
-    return str(fpath)
+def build_alert_df(df: pd.DataFrame, watchlist: List[str], threshold: float) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-# ─────────── Orquestación (una sola categoría/URL) ───────────
-def run_one(url: str, out_prefix: str, headless: bool, max_pages: int, save_dir: Path):
-    save_dir.mkdir(parents=True, exist_ok=True)
+    wl = {_normalize_brand(x) for x in watchlist}
+    d = df.copy()
+    d["brand_norm"] = d["brand"].apply(_normalize_brand)
+    d["discount_pct"] = pd.to_numeric(d["discount_pct"], errors="coerce")
+    alert = d[(d["brand_norm"].isin(wl)) & (d["discount_pct"] >= float(threshold))].copy()
+    keep = [c for c in ["brand", "name", "list_price", "sale_price", "discount_pct", "promo", "url", "page"] if c in alert.columns]
+    return alert[keep].sort_values(["brand", "discount_pct"], ascending=[True, False])
 
-    rows = scrape_category(url=url, headless=headless, max_pages=max_pages)
-    df = pd.DataFrame(rows)
-    _normalize_numeric(df)
-    if "product_id" in df.columns: df["product_id"] = df["product_id"].astype("string")
-    if "sku" in df.columns: df["sku"] = df["sku"].astype("string")
 
-    prev_pq = _latest_previous_parquet(out_prefix, save_dir)
-    prev_df = None
-    if prev_pq and prev_pq.exists():
-        try:
-            prev_df = pd.read_parquet(prev_pq)
-            _normalize_numeric(prev_df)
-            for d in (df, prev_df):
-                if "product_id" in d.columns: d["product_id"] = d["product_id"].astype("string")
-                if "sku" in d.columns: d["sku"] = d["sku"].astype("string")
-        except Exception as e:
-            print(f"⚠️ No pude leer previo {prev_pq.name}: {e}")
+# -----------------------------
+# Main
+# -----------------------------
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
 
-    # diffs SIEMPRE 4 valores
-    key, changes_df, new_df, removed_df = _compute_diffs(prev_df, df)
+    ap.add_argument("--presets", default="", help="Comma-separated presets (hombre,mujer,belleza,...)")
+    ap.add_argument("--urls", default="", help="URLs multiline (manual).")
+    ap.add_argument("--urls-file", default="", help="Archivo con 1 URL por línea.")
+    ap.add_argument("--discover", default="false", help="true => imprime links del home y sale.")
+    ap.add_argument("--home-url", default="https://www.elpalaciodehierro.com/")
 
-    # alertas por marca con descuento
-    brands = _load_alert_brands()
-    min_disc = float(os.environ.get("ALERT_MIN_DISC", "30"))
-    hits_new = _filter_alert_hits_new(new_df, min_disc, brands)
-    hits_changes = _filter_alert_hits_changes(changes_df, min_disc, brands)
-    if (hits_new is not None and not hits_new.empty) or (hits_changes is not None and not hits_changes.empty):
-        atts = []
-        if hits_new is not None and not hits_new.empty:
-            bio = io.BytesIO(); hits_new.to_excel(bio, index=False)
-            atts.append((f"{out_prefix}_ALERT_NEW.xlsx", bio.getvalue(),
-                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
-        if hits_changes is not None and not hits_changes.empty:
-            bio = io.BytesIO(); hits_changes.to_excel(bio, index=False)
-            atts.append((f"{out_prefix}_ALERT_CHANGES.xlsx", bio.getvalue(),
-                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
-        body = (f"URL: {url}\nPrefijo: {out_prefix}\nUmbral: {min_disc}%\n"
-                f"Marcas: {', '.join(sorted(brands)) or '(todas)'}\n"
-                f"NEW: {0 if hits_new is None else len(hits_new)} | "
-                f"CHANGES: {0 if hits_changes is None else len(hits_changes)}")
-        _send_email(f"[Scraper] Alertas {out_prefix}", body, atts)
+    ap.add_argument("--max-pages", default="10")
+    ap.add_argument("--stop-after-empty", default="1")
+    ap.add_argument("--scroll-steps", default="4")
+    ap.add_argument("--headless", default="true")
 
-    xlsx_path = save_xlsx(df, out_prefix, save_dir)
-    pq_path   = save_parquet(df, out_prefix, save_dir)
+    ap.add_argument("--out-dir", default="outputs")
+    ap.add_argument("--history-dir", default="outputs/history")
+    ap.add_argument("--discount-threshold", default="51")
 
-    big51 = int(df.get("discount_pct", pd.Series(dtype=float)).fillna(0).ge(51).sum())
-    print(f"🔢 Filas: {len(df)} | ≥51%: {big51}")
-    print(f"Último previo: {prev_pq.name if prev_pq else '—'}")
-    print(f"NEW={0 if new_df is None else len(new_df)} "
-          f"CHANGES={0 if changes_df is None else len(changes_df)} "
-          f"REMOVED={0 if removed_df is None else len(removed_df)}")
-    return df, xlsx_path, pq_path
+    ap.add_argument("--send-email", default="false")
+    ap.add_argument("--upload-drive", default="false")  # lo maneja el workflow (rclone), aquí solo queda el flag
 
-# ─────────── CLI manual ───────────
-CATEGORIES = {
-    "mujer":  "https://www.elpalaciodehierro.com/mujer/",
+    return ap.parse_args()
+
+
+PRESET_URLS = {
     "hombre": "https://www.elpalaciodehierro.com/hombre/",
-    "nina":   "https://www.elpalaciodehierro.com/nina/",
-    "nino":   "https://www.elpalaciodehierro.com/nino/",
-    "hogar":  "https://www.elpalaciodehierro.com/hogar/",
-    "belleza":"https://www.elpalaciodehierro.com/belleza/",
-    "ofertas":"https://www.elpalaciodehierro.com/outlet/"
+    "mujer": "https://www.elpalaciodehierro.com/mujer/",
+    "belleza": "https://www.elpalaciodehierro.com/belleza/",
+    "hogar": "https://www.elpalaciodehierro.com/hogar/",
+    "gourmet": "https://www.elpalaciodehierro.com/gourmet/",
+    "marcas": "https://www.elpalaciodehierro.com/marcas/",
 }
 
-def prompt_menu():
-    print("Elige una categoría o escribe una URL completa:")
-    keys = list(CATEGORIES.keys())
-    for i, k in enumerate(keys, 1):
-        print(f" {i}) {k} → {CATEGORIES[k]}")
-    raw = input("Número/URL: ").strip()
-    if raw.isdigit():
-        ix = int(raw)
-        if 1 <= ix <= len(keys):
-            return keys[ix-1], CATEGORIES[keys[ix-1]]
-        else:
-            print("Opción inválida, usando 'hombre'.")
-            return "hombre", CATEGORIES["hombre"]
-    if raw.lower().startswith("http"):
-        return "custom", raw
-    print("Opción inválida, usando 'hombre'.")
-    return "hombre", CATEGORIES["hombre"]
+
+def collect_urls(args: argparse.Namespace) -> List[str]:
+    urls: List[str] = []
+
+    if args.urls_file:
+        p = Path(args.urls_file)
+        if p.exists():
+            for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls.append(line)
+
+    if args.urls.strip():
+        for line in args.urls.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                urls.append(line)
+
+    presets = [x.strip().lower() for x in (args.presets or "").split(",") if x.strip()]
+    for pr in presets:
+        if pr in PRESET_URLS:
+            urls.append(PRESET_URLS[pr])
+
+    # de-dup
+    out = []
+    seen = set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def main() -> int:
+    args = parse_args()
+
+    if _to_bool(args.discover):
+        links = discover_from_home(args.home_url)
+        print(f"Found {len(links)} links from home menu:")
+        for x in links[:250]:
+            print(f"[lvl{x.level}] {x.label} -> {x.url}")
+        return 0
+
+    urls = collect_urls(args)
+    if not urls:
+        print("No URLs provided. Usa --urls / --urls-file / --presets o --discover=true")
+        return 2
+
+    out_dir = Path(args.out_dir)
+    history_dir = Path(args.history_dir)
+    history_dir.mkdir(parents=True, exist_ok=True)
+
+    driver = make_driver(headless=_to_bool(args.headless))
+
+    watchlist = _read_lines_env("BRAND_WATCHLIST")
+    threshold = float(args.discount_threshold)
+
+    try:
+        for base_url in urls:
+            prefix = _slug(urlparse(base_url).path or base_url)
+            print(f"\n=== SCRAPE: {base_url} (prefix={prefix}) ===")
+
+            cur_df = scrape_category(
+                driver=driver,
+                base_url=base_url,
+                max_pages=int(args.max_pages),
+                stop_after_empty=int(args.stop_after_empty),
+                scroll_steps=int(args.scroll_steps),
+            )
+
+            prev_path = _latest_snapshot(history_dir, prefix)
+            prev_df = pd.read_parquet(prev_path) if prev_path else None
+
+            key_col, changes_df, new_df, removed_df = compute_diffs(prev_df, cur_df)
+
+            xlsx_path, snap_path = write_outputs(
+                out_dir=out_dir,
+                prefix=prefix,
+                cur_df=cur_df,
+                key_col=key_col,
+                changes_df=changes_df,
+                new_df=new_df,
+                removed_df=removed_df,
+            )
+
+            # copia snapshot a history
+            snap_hist = history_dir / snap_path.name
+            snap_path.replace(snap_hist)
+
+            print(f"[ok] snapshot={len(cur_df)} new={len(new_df)} changed={len(changes_df)} removed={len(removed_df)}")
+            print(f"[files] {xlsx_path.name} + {snap_hist.name}")
+
+            # Alertas por marca (por categoría)
+            if _to_bool(args.send_email) and watchlist:
+                alert_new = build_alert_df(new_df, watchlist, threshold)
+                alert_changed = build_alert_df(changes_df, watchlist, threshold)
+
+                if not alert_new.empty or not alert_changed.empty:
+                    def _html_table(df: pd.DataFrame, title: str) -> str:
+                        if df.empty:
+                            return ""
+                        return f"<h3>{title}</h3>" + df.to_html(index=False, escape=False)
+
+                    html = (
+                        f"<p><b>URL:</b> {base_url}</p>"
+                        f"<p><b>threshold:</b> {threshold}%</p>"
+                        + _html_table(alert_new, "Nuevos (watchlist)")
+                        + _html_table(alert_changed, "Cambiados (watchlist)")
+                    )
+                    send_email(
+                        subject=f"[Palacio Alert] {prefix} (>= {threshold}%)",
+                        html_body=html,
+                        attachments=[xlsx_path],
+                    )
+
+    finally:
+        driver.quit()
+
+    return 0
+
 
 if __name__ == "__main__":
-    save_dir = Path(os.environ.get("SAVE_DIR", "/tmp/palacio_out"))
-
-    cat_key, url = prompt_menu()
-    headless = _env_bool("HEADLESS", True)
-    try:
-        max_pages = int(os.environ.get("MAX_PAGES", "50"))
-    except Exception:
-        max_pages = 50
-    out_prefix = os.environ.get("OUT_PREFIX", f"palacio_{cat_key}")
-
-    hp = input(f"Headless? [Y/n] (actual={headless}): ").strip().lower()
-    if hp in ("n", "no", "0"): headless = False
-    mp = input(f"Max pages? (actual={max_pages}): ").strip()
-    if mp.isdigit(): max_pages = int(mp)
-    op = input(f"Prefijo salida? (actual={out_prefix}): ").strip()
-    if op: out_prefix = op
-
-    print(f"\n>>> RUN <<<\n  cat/url: {url}\n  headless={headless}\n  max_pages={max_pages}\n  prefix={out_prefix}\n  SAVE_DIR={save_dir}\n")
-    run_one(url=url, out_prefix=out_prefix, headless=headless, max_pages=max_pages, save_dir=save_dir)
+    raise SystemExit(main())
