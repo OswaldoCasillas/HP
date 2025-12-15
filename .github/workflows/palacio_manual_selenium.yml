@@ -80,7 +80,6 @@ jobs:
       - name: Setup Chrome
         uses: browser-actions/setup-chrome@v1
 
-      # ✅ ESTE ERA EL QUE FALTABA
       - name: Install rclone (si upload_drive=true)
         if: ${{ inputs.upload_drive }}
         run: |
@@ -110,7 +109,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p outputs/history
-          rclone copy "gdrive:" "outputs/history" --include "*_snapshot_*.parquet" -v --retries 3 || true
+          # 👇 ahora lee de subcarpeta "manual"
+          rclone copy "gdrive:manual" "outputs/history" --include "*_snapshot_*.parquet" -v --retries 3 || true
           ls -lh outputs/history || true
 
       - name: Run scraper
@@ -153,6 +153,7 @@ jobs:
         if: ${{ inputs.upload_drive }}
         run: |
           set -euo pipefail
-          rclone copy "outputs" "gdrive:" \
+          # 👇 ahora escribe en subcarpeta "manual"
+          rclone copy "outputs" "gdrive:manual" \
             --include "*.xlsx" --include "history/*.parquet" \
             --create-empty-src-dirs -v --retries 3
