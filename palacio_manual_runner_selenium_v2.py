@@ -7,25 +7,29 @@ import json
 import os
 import re
 import smtplib
-import sys
 import time
 import random
 from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import (
+    urlparse,
+    urlunparse,
+    parse_qs,
+    urlencode,
+    urljoin,
+    quote_plus,
+)
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from tenacity import retry, stop_after_attempt, wait_fixed
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
 
@@ -33,7 +37,6 @@ from selenium.common.exceptions import TimeoutException
 # Helpers
 # -----------------------------
 def _now_cdmx_iso() -> str:
-    # runner suele estar en UTC; esto es solo “timestamp de ejecución”
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
@@ -67,7 +70,6 @@ def _pct_discount(list_price: Optional[float], sale_price: Optional[float]) -> O
 
 def _read_lines_env(name: str) -> List[str]:
     raw = os.getenv(name, "") or ""
-    # admite newline, coma o punto y coma
     parts = []
     for chunk in re.split(r"[\n,;]+", raw):
         c = chunk.strip()
@@ -91,10 +93,6 @@ class CategoryLink:
 
 
 def discover_from_home(home_url: str = "https://www.elpalaciodehierro.com/") -> List[CategoryLink]:
-    """
-    Extrae links del menú usando clases b-categories_navigation-link_1/2/3 (se ven en tu HTML home).
-    Ejemplos: HOMBRE, y subcategorías como /hombre/ropa/playeras-moda/ etc.
-    """
     r = requests.get(home_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
@@ -105,14 +103,12 @@ def discover_from_home(home_url: str = "https://www.elpalaciodehierro.com/") -> 
             href = a.get("href", "").strip()
             if not href:
                 continue
-            # normaliza a URL absoluta
             if href.startswith("/"):
                 href = urljoin(home_url, href)
             label = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
             if label:
                 out.append(CategoryLink(label=label, url=href, level=lvl))
 
-    # de-dup conservando orden
     seen = set()
     uniq = []
     for x in out:
@@ -127,10 +123,6 @@ def discover_from_home(home_url: str = "https://www.elpalaciodehierro.com/") -> 
 # Pagination by URL (?params={"page":N})
 # -----------------------------
 def build_page_url(base_url: str, page: int) -> str:
-    """
-    Palacio usa paginación via ?params=%7B%22page%22%3A2%7D ...
-    Si base_url ya trae params, lo reemplaza; si no, lo agrega.
-    """
     if page <= 1:
         return base_url
 
@@ -143,7 +135,6 @@ def build_page_url(base_url: str, page: int) -> str:
 
     params_obj = {}
     if params_raw:
-        # viene como JSON string o URL-encoded; parse_qs ya lo decodifica
         try:
             params_obj = json.loads(params_raw)
         except Exception:
@@ -164,19 +155,16 @@ def make_driver(headless: bool = True) -> webdriver.Chrome:
     if headless:
         opts.add_argument("--headless=new")
 
-    # estabilidad en GitHub Actions
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1400,900")
     opts.add_argument("--lang=es-MX")
 
-    # reduce “automation fingerprints” y logs ruidosos
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--disable-blink-features=AutomationControlled")
 
-    # user-agent fijo (reduce interstitial raros)
     opts.add_argument(
         "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -186,7 +174,6 @@ def make_driver(headless: bool = True) -> webdriver.Chrome:
 
 
 def gentle_scroll(driver: webdriver.Chrome, steps: int = 4) -> None:
-    # ayuda a cargar lazy content (si aplica)
     try:
         h = driver.execute_script("return document.body.scrollHeight") or 0
         for i in range(1, steps + 1):
@@ -203,9 +190,8 @@ def _looks_blocked(page_source: str) -> bool:
         "access denied",
         "request blocked",
         "unusual traffic",
-        "verify you are",
+        "i am not a robot",
         "captcha",
-        "robot",
         "/cdn-cgi/",
     ]
     return any(x in s for x in bad)
@@ -225,22 +211,17 @@ def _looks_end_of_results(page_source: str) -> bool:
 def wait_for_plp(driver: webdriver.Chrome, timeout: int = 35) -> bool:
     """
     True => hay productos.
-    False => página sin productos (fin/no-results). No debe crashear el run.
-
-    Lanza TimeoutException solo si parece “bloqueo/interstitial” o carga rota.
+    False => página sin productos (fin/no-results). No crashea.
+    Lanza TimeoutException solo si parece bloqueo/interstitial.
     """
     w = WebDriverWait(driver, timeout)
-
-    # 1) readyState al menos complete
     w.until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
 
-    # 2) esperar tiles, pero sin asumir que siempre existen
     deadline = time.time() + timeout
     tile_css = "article.l-plp-grid_item.m-product, article.b-product_tile_item"
 
     while time.time() < deadline:
-        tiles = driver.find_elements(By.CSS_SELECTOR, tile_css)
-        if tiles:
+        if driver.find_elements(By.CSS_SELECTOR, tile_css):
             return True
 
         src = driver.page_source or ""
@@ -252,21 +233,15 @@ def wait_for_plp(driver: webdriver.Chrome, timeout: int = 35) -> bool:
 
         time.sleep(0.4)
 
-    # si no cargó tiles, lo tratamos como “vacío” para que stop_after_empty corte
     return False
 
 
 # -----------------------------
-# Product extraction (robust via data-analytics)
+# Product extraction
 # -----------------------------
 def extract_product_from_article(article) -> Dict:
-    """
-    En cada item hay un .b-product con data-analytics JSON (id/name/brand/price/metric1...).
-    También hay markup de precios old/sales.
-    """
     out: Dict = {}
 
-    # 1) data-analytics
     pdata = {}
     try:
         prod = article.find_element(By.CSS_SELECTOR, ".b-product[data-analytics]")
@@ -283,11 +258,9 @@ def extract_product_from_article(article) -> Dict:
     out["department_id"] = pdata.get("departmentID")
     out["department_name"] = pdata.get("departmentName")
 
-    # precios “preferidos” desde analytics
     out["sale_price"] = _safe_float(pdata.get("price"))
     out["list_price"] = _safe_float(pdata.get("metric1"))
 
-    # 2) fallback: leer del DOM
     try:
         tile = article.find_element(By.CSS_SELECTOR, ".b-product_tile")
     except Exception:
@@ -305,7 +278,6 @@ def extract_product_from_article(article) -> Dict:
         except Exception:
             out["name"] = None
 
-    # URL producto
     out["url"] = None
     for sel in ("a[data-js-product-tile-name]", "a.b-product_tile-image", "h3.b-product_tile-name a", "a[href*='/p/']"):
         try:
@@ -317,13 +289,11 @@ def extract_product_from_article(article) -> Dict:
         except Exception:
             continue
 
-    # badge promo
     try:
         out["promo"] = tile.find_element(By.CSS_SELECTOR, ".b-product_tile-badge_promo").text.strip()
     except Exception:
         out["promo"] = None
 
-    # DOM prices fallback
     def _dom_price(css: str) -> Optional[float]:
         try:
             el = tile.find_element(By.CSS_SELECTOR, css)
@@ -361,13 +331,11 @@ def scrape_category(
         page_url = build_page_url(base_url, page)
         print(f"[page {page}/{max_pages}] {page_url}")
 
-        # jitter para bajar bloqueos/intermitencias
         time.sleep(random.uniform(0.3, 1.0))
 
         loaded = False
         has_products = False
 
-        # retries “suaves” por página
         for attempt in range(1, 4):
             driver.get(page_url)
             try:
@@ -383,7 +351,6 @@ def scrape_category(
                 time.sleep(2)
 
         if not loaded:
-            # si después de 3 intentos sigue raro, lo tratamos como página vacía para cortar sin romper todo
             has_products = False
 
         if has_products:
@@ -423,12 +390,9 @@ def scrape_category(
     if df.empty:
         return df
 
-    # numerics + discount
     df["list_price"] = pd.to_numeric(df["list_price"], errors="coerce")
     df["sale_price"] = pd.to_numeric(df["sale_price"], errors="coerce")
     df["discount_pct"] = df.apply(lambda r: _pct_discount(r["list_price"], r["sale_price"]), axis=1)
-
-    # limpia nulos “vacíos”
     df.replace({"": None}, inplace=True)
     return df
 
@@ -452,9 +416,6 @@ def compute_diffs(
     key_col: str = "product_id",
     compare_cols: Tuple[str, ...] = ("list_price", "sale_price", "discount_pct", "promo"),
 ) -> Tuple[str, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    REGRESA SIEMPRE 4: (key_col, changes_df, new_df, removed_df)
-    """
     if cur_df is None or cur_df.empty:
         empty = pd.DataFrame()
         return key_col, empty, empty, empty
@@ -468,7 +429,6 @@ def compute_diffs(
 
     prev = prev_df.copy()
     if cur_key not in prev.columns:
-        # si antes venía con url como key, cae ahí
         alt = "url" if "url" in prev.columns else None
         if alt:
             cur_key = alt
@@ -477,7 +437,6 @@ def compute_diffs(
 
     prev[cur_key] = prev[cur_key].astype(str)
 
-    # NEW / REMOVED
     cur_keys = set(cur[cur_key].dropna())
     prev_keys = set(prev[cur_key].dropna())
 
@@ -487,7 +446,6 @@ def compute_diffs(
     new_df = cur[cur[cur_key].isin(new_keys)].copy()
     removed_df = prev[prev[cur_key].isin(removed_keys)].copy()
 
-    # CHANGED (join)
     common_prev = prev[prev[cur_key].isin(cur_keys)].copy()
     common_cur = cur[cur[cur_key].isin(prev_keys)].copy()
 
@@ -504,7 +462,7 @@ def compute_diffs(
         for c in compare_cols:
             a = r.get(c)
             b = r.get(f"{c}_prev")
-            # floats: tolerancia
+
             if isinstance(a, (int, float)) or isinstance(b, (int, float)):
                 if pd.isna(a) and pd.isna(b):
                     continue
@@ -543,7 +501,6 @@ def write_outputs(
     xlsx_path = out_dir / f"{prefix}_report_{ts}.xlsx"
     snap_path = out_dir / f"{prefix}_snapshot_{ts}.parquet"
 
-    # summary
     summary = pd.DataFrame(
         [{
             "prefix": prefix,
@@ -563,7 +520,6 @@ def write_outputs(
         changes_df.to_excel(writer, sheet_name="changed_items", index=False)
         removed_df.to_excel(writer, sheet_name="removed_items", index=False)
 
-        # formato básico
         wb = writer.book
         fmt_money = wb.add_format({"num_format": "$#,##0.00"})
         fmt_pct = wb.add_format({"num_format": "0.00"})
@@ -572,7 +528,6 @@ def write_outputs(
             ws = writer.sheets.get(sh)
             if not ws:
                 continue
-            # auto width simple
             try:
                 df = {"snapshot": cur_df, "new_items": new_df, "changed_items": changes_df, "removed_items": removed_df}[sh]
                 for i, col in enumerate(df.columns):
@@ -594,11 +549,7 @@ def write_outputs(
 # -----------------------------
 # Email alerts
 # -----------------------------
-def send_email(
-    subject: str,
-    html_body: str,
-    attachments: Optional[List[Path]] = None,
-) -> None:
+def send_email(subject: str, html_body: str, attachments: Optional[List[Path]] = None) -> None:
     host = os.getenv("SMTP_HOST", "")
     port = int(os.getenv("SMTP_PORT", "587"))
     user = os.getenv("SMTP_USER", "")
@@ -620,12 +571,7 @@ def send_email(
         if not p.exists():
             continue
         data = p.read_bytes()
-        msg.add_attachment(
-            data,
-            maintype="application",
-            subtype="octet-stream",
-            filename=p.name,
-        )
+        msg.add_attachment(data, maintype="application", subtype="octet-stream", filename=p.name)
 
     with smtplib.SMTP(host, port) as s:
         s.starttls()
@@ -652,11 +598,12 @@ def build_alert_df(df: pd.DataFrame, watchlist: List[str], threshold: float) -> 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--presets", default="", help="Comma-separated presets (hombre,mujer,belleza,...)")
+    ap.add_argument("--presets", default="", help="Comma-separated presets (hombre,mujer,ofertas,...)")
     ap.add_argument("--urls", default="", help="URLs multiline (manual).")
     ap.add_argument("--urls-file", default="", help="Archivo con 1 URL por línea.")
     ap.add_argument("--discover", default="false", help="true => imprime links del home y sale.")
     ap.add_argument("--home-url", default="https://www.elpalaciodehierro.com/")
+    ap.add_argument("--search-term", default="", help="Termino(s) para buscar en /buscar?q=. Admite coma o newline.")
 
     ap.add_argument("--max-pages", default="10")
     ap.add_argument("--stop-after-empty", default="1")
@@ -668,7 +615,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--discount-threshold", default="51")
 
     ap.add_argument("--send-email", default="false")
-    ap.add_argument("--upload-drive", default="false")  # lo maneja el workflow (rclone), aquí solo queda el flag
+    ap.add_argument("--upload-drive", default="false")
 
     return ap.parse_args()
 
@@ -680,6 +627,17 @@ PRESET_URLS = {
     "hogar": "https://www.elpalaciodehierro.com/hogar/",
     "gourmet": "https://www.elpalaciodehierro.com/gourmet/",
     "marcas": "https://www.elpalaciodehierro.com/marcas/",
+
+    # ✅ nuevos (los que pediste)
+    "ofertas": "https://www.elpalaciodehierro.com/ofertas",
+    "lo_mas_vendido": "https://www.elpalaciodehierro.com/lo-mas-vendido",
+    "deportes": "https://www.elpalaciodehierro.com/deportes",
+    "marcas_nuevas": "https://www.elpalaciodehierro.com/marcas-nuevas",
+
+    # ✅ calzado (por si lo usas en dropdown)
+    "calzado": "https://www.elpalaciodehierro.com/calzado/",
+    "calzado_mujer": "https://www.elpalaciodehierro.com/mujer/calzado/",
+    "zapatos_hombre": "https://www.elpalaciodehierro.com/hombre/zapatos/",
 }
 
 
@@ -701,9 +659,24 @@ def collect_urls(args: argparse.Namespace) -> List[str]:
                 urls.append(line)
 
     presets = [x.strip().lower() for x in (args.presets or "").split(",") if x.strip()]
+    unknown = []
     for pr in presets:
         if pr in PRESET_URLS:
             urls.append(PRESET_URLS[pr])
+        else:
+            unknown.append(pr)
+
+    if unknown:
+        print(f"[error] Preset(s) inválido(s): {', '.join(unknown)}")
+        print("[info] Presets disponibles:", ", ".join(sorted(PRESET_URLS.keys())))
+
+    # Search term(s) -> /buscar?q=...
+    if (args.search_term or "").strip():
+        for term in re.split(r"[\n,;]+", args.search_term):
+            term = term.strip()
+            if not term:
+                continue
+            urls.append(f"https://www.elpalaciodehierro.com/buscar?q={quote_plus(term)}")
 
     # de-dup
     out = []
@@ -727,7 +700,8 @@ def main() -> int:
 
     urls = collect_urls(args)
     if not urls:
-        print("No URLs provided. Usa --urls / --urls-file / --presets o --discover=true")
+        print("No URLs provided. Usa --urls / --urls-file / --presets o --discover=true o --search-term.")
+        print("[info] Presets disponibles:", ", ".join(sorted(PRESET_URLS.keys())))
         return 2
 
     out_dir = Path(args.out_dir)
@@ -767,14 +741,12 @@ def main() -> int:
                 removed_df=removed_df,
             )
 
-            # copia snapshot a history
             snap_hist = history_dir / snap_path.name
             snap_path.replace(snap_hist)
 
             print(f"[ok] snapshot={len(cur_df)} new={len(new_df)} changed={len(changes_df)} removed={len(removed_df)}")
             print(f"[files] {xlsx_path.name} + {snap_hist.name}")
 
-            # Alertas por marca (por categoría)
             if _to_bool(args.send_email) and watchlist:
                 alert_new = build_alert_df(new_df, watchlist, threshold)
                 alert_changed = build_alert_df(changes_df, watchlist, threshold)
