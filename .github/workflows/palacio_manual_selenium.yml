@@ -74,7 +74,7 @@ on:
         description: "Enviar alertas por correo (solo si hay NEW/CHANGED + descuento + marca en watchlist)"
         type: boolean
         required: true
-        default: false
+        default: true
 
       upload_drive:
         description: "Subir resultados a Google Drive (XLSX + history/*.parquet)"
