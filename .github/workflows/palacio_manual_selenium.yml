@@ -11,16 +11,43 @@ on:
         options:
           - preset
           - urls
+          - search
           - discover
 
-      presets:
-        description: "Presets (coma). Ej: hombre,mujer,hogar,gourmet  (solo si mode=preset)"
+      preset:
+        description: "Preset principal (dropdown)"
+        type: choice
+        required: true
+        default: mujer
+        options:
+          - hombre
+          - mujer
+          - belleza
+          - hogar
+          - gourmet
+          - marcas
+          - ofertas
+          - lo_mas_vendido
+          - deportes
+          - marcas_nuevas
+          - calzado
+          - calzado_mujer
+          - zapatos_hombre
+
+      more_presets:
+        description: "Opcional: más presets (coma). Ej: ofertas,deportes"
         type: string
         required: false
-        default: "hombre"
+        default: ""
 
       urls:
         description: "URLs (una por línea) (solo si mode=urls)"
+        type: string
+        required: false
+        default: ""
+
+      search_term:
+        description: "Palabra/frase para buscar (solo si mode=search). Ej: navidad o 'botas mujer' (admite coma)"
         type: string
         required: false
         default: ""
@@ -77,8 +104,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Setup Chrome
+      - name: Setup Chrome (stable)
         uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-dependencies: true
 
       - name: Install rclone (si upload_drive=true)
         if: ${{ inputs.upload_drive }}
@@ -109,7 +139,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p outputs/history
-          # 👇 ahora lee de subcarpeta "manual"
           rclone copy "gdrive:manual" "outputs/history" --include "*_snapshot_*.parquet" -v --retries 3 || true
           ls -lh outputs/history || true
 
@@ -136,8 +165,15 @@ jobs:
             args+=(--discover true)
           elif [[ "${{ inputs.mode }}" == "urls" ]]; then
             args+=(--urls-file "urls.txt")
+          elif [[ "${{ inputs.mode }}" == "search" ]]; then
+            args+=(--search-term "${{ inputs.search_term }}")
           else
-            args+=(--presets "${{ inputs.presets }}")
+            preset="${{ inputs.preset }}"
+            more="${{ inputs.more_presets }}"
+            if [[ -n "${more// }" ]]; then
+              preset="$preset,$more"
+            fi
+            args+=(--presets "$preset")
           fi
 
           echo "Running: python palacio_manual_runner_selenium_v2.py ${args[*]}"
@@ -153,7 +189,6 @@ jobs:
         if: ${{ inputs.upload_drive }}
         run: |
           set -euo pipefail
-          # 👇 ahora escribe en subcarpeta "manual"
           rclone copy "outputs" "gdrive:manual" \
             --include "*.xlsx" --include "history/*.parquet" \
             --create-empty-src-dirs -v --retries 3
