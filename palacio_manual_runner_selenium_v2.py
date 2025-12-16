@@ -628,13 +628,11 @@ PRESET_URLS = {
     "gourmet": "https://www.elpalaciodehierro.com/gourmet/",
     "marcas": "https://www.elpalaciodehierro.com/marcas/",
 
-    # ✅ nuevos (los que pediste)
     "ofertas": "https://www.elpalaciodehierro.com/ofertas",
     "lo_mas_vendido": "https://www.elpalaciodehierro.com/lo-mas-vendido",
     "deportes": "https://www.elpalaciodehierro.com/deportes",
     "marcas_nuevas": "https://www.elpalaciodehierro.com/marcas-nuevas",
 
-    # ✅ calzado (por si lo usas en dropdown)
     "calzado": "https://www.elpalaciodehierro.com/calzado/",
     "calzado_mujer": "https://www.elpalaciodehierro.com/mujer/calzado/",
     "zapatos_hombre": "https://www.elpalaciodehierro.com/hombre/zapatos/",
@@ -670,7 +668,6 @@ def collect_urls(args: argparse.Namespace) -> List[str]:
         print(f"[error] Preset(s) inválido(s): {', '.join(unknown)}")
         print("[info] Presets disponibles:", ", ".join(sorted(PRESET_URLS.keys())))
 
-    # Search term(s) -> /buscar?q=...
     if (args.search_term or "").strip():
         for term in re.split(r"[\n,;]+", args.search_term):
             term = term.strip()
@@ -678,7 +675,6 @@ def collect_urls(args: argparse.Namespace) -> List[str]:
                 continue
             urls.append(f"https://www.elpalaciodehierro.com/buscar?q={quote_plus(term)}")
 
-    # de-dup
     out = []
     seen = set()
     for u in urls:
@@ -747,27 +743,30 @@ def main() -> int:
             print(f"[ok] snapshot={len(cur_df)} new={len(new_df)} changed={len(changes_df)} removed={len(removed_df)}")
             print(f"[files] {xlsx_path.name} + {snap_hist.name}")
 
-            if _to_bool(args.send_email) and watchlist:
-                alert_new = build_alert_df(new_df, watchlist, threshold)
-                alert_changed = build_alert_df(changes_df, watchlist, threshold)
+            # ✅ CAMBIO: mandar correo SIEMPRE (si send_email=true), sin importar NEW/CHANGED/watchlist
+            if _to_bool(args.send_email):
+                alert_new = build_alert_df(new_df, watchlist, threshold) if watchlist else pd.DataFrame()
+                alert_changed = build_alert_df(changes_df, watchlist, threshold) if watchlist else pd.DataFrame()
 
-                if not alert_new.empty or not alert_changed.empty:
-                    def _html_table(df: pd.DataFrame, title: str) -> str:
-                        if df.empty:
-                            return ""
-                        return f"<h3>{title}</h3>" + df.to_html(index=False, escape=False)
+                def _html_table(df: pd.DataFrame, title: str) -> str:
+                    if df is None or df.empty:
+                        return f"<p><i>{title}: (sin registros)</i></p>"
+                    return f"<h3>{title}</h3>" + df.to_html(index=False, escape=False)
 
-                    html = (
-                        f"<p><b>URL:</b> {base_url}</p>"
-                        f"<p><b>threshold:</b> {threshold}%</p>"
-                        + _html_table(alert_new, "Nuevos (watchlist)")
-                        + _html_table(alert_changed, "Cambiados (watchlist)")
-                    )
-                    send_email(
-                        subject=f"[Palacio Alert] {prefix} (>= {threshold}%)",
-                        html_body=html,
-                        attachments=[xlsx_path],
-                    )
+                html = (
+                    f"<p><b>URL:</b> {base_url}</p>"
+                    f"<p><b>threshold:</b> {threshold}%</p>"
+                    f"<p><b>snapshot:</b> {len(cur_df)} | <b>new:</b> {len(new_df)} | "
+                    f"<b>changed:</b> {len(changes_df)} | <b>removed:</b> {len(removed_df)}</p>"
+                    + _html_table(alert_new, "Watchlist + threshold (Nuevos)")
+                    + _html_table(alert_changed, "Watchlist + threshold (Cambiados)")
+                )
+
+                send_email(
+                    subject=f"[Palacio Report] {prefix} | snap={len(cur_df)} new={len(new_df)} chg={len(changes_df)} rm={len(removed_df)}",
+                    html_body=html,
+                    attachments=[xlsx_path],
+                )
 
     finally:
         driver.quit()
