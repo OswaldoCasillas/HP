@@ -8,6 +8,8 @@ import os
 import re
 import smtplib
 import sys
+import time
+import random
 from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
@@ -24,6 +26,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 
 # -----------------------------
@@ -90,7 +93,7 @@ class CategoryLink:
 def discover_from_home(home_url: str = "https://www.elpalaciodehierro.com/") -> List[CategoryLink]:
     """
     Extrae links del menú usando clases b-categories_navigation-link_1/2/3 (se ven en tu HTML home).
-    Ejemplos: HOMBRE, y subcategorías como /hombre/ropa/playeras-moda/ etc. :contentReference[oaicite:5]{index=5}
+    Ejemplos: HOMBRE, y subcategorías como /hombre/ropa/playeras-moda/ etc.
     """
     r = requests.get(home_url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
@@ -125,7 +128,7 @@ def discover_from_home(home_url: str = "https://www.elpalaciodehierro.com/") -> 
 # -----------------------------
 def build_page_url(base_url: str, page: int) -> str:
     """
-    Palacio usa paginación via ?params=%7B%22page%22%3A2%7D ... :contentReference[oaicite:6]{index=6}
+    Palacio usa paginación via ?params=%7B%22page%22%3A2%7D ...
     Si base_url ya trae params, lo reemplaza; si no, lo agrega.
     """
     if page <= 1:
@@ -159,30 +162,27 @@ def build_page_url(base_url: str, page: int) -> str:
 def make_driver(headless: bool = True) -> webdriver.Chrome:
     opts = ChromeOptions()
     if headless:
-        # headless “new” suele evitar el SessionNotCreated típico en GH
         opts.add_argument("--headless=new")
+
+    # estabilidad en GitHub Actions
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1400,900")
     opts.add_argument("--lang=es-MX")
-    # evita logs ruidosos
-    opts.add_experimental_option("excludeSwitches", ["enable-logging"])
-    return webdriver.Chrome(options=opts)
 
+    # reduce “automation fingerprints” y logs ruidosos
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument("--disable-blink-features=AutomationControlled")
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
-def wait_for_plp(driver: webdriver.Chrome, timeout: int = 25) -> None:
-    """
-    Espera a que aparezcan productos (tiles).
-    En tu HTML PLP se ven artículos l-plp-grid_item m-product. :contentReference[oaicite:7]{index=7}
-    """
-    w = WebDriverWait(driver, timeout)
-    w.until(
-        EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "article.l-plp-grid_item.m-product, article.b-product_tile_item")
-        )
+    # user-agent fijo (reduce interstitial raros)
+    opts.add_argument(
+        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
+
+    return webdriver.Chrome(options=opts)
 
 
 def gentle_scroll(driver: webdriver.Chrome, steps: int = 4) -> None:
@@ -192,8 +192,68 @@ def gentle_scroll(driver: webdriver.Chrome, steps: int = 4) -> None:
         for i in range(1, steps + 1):
             y = int(h * i / (steps + 1))
             driver.execute_script("window.scrollTo(0, arguments[0]);", y)
+            time.sleep(0.15)
     except Exception:
         pass
+
+
+def _looks_blocked(page_source: str) -> bool:
+    s = (page_source or "").lower()
+    bad = [
+        "access denied",
+        "request blocked",
+        "unusual traffic",
+        "verify you are",
+        "captcha",
+        "robot",
+        "/cdn-cgi/",
+    ]
+    return any(x in s for x in bad)
+
+
+def _looks_end_of_results(page_source: str) -> bool:
+    s = (page_source or "").lower()
+    markers = [
+        "no se encontraron",
+        "sin resultados",
+        "0 resultados",
+        "ningún resultado",
+    ]
+    return any(x in s for x in markers)
+
+
+def wait_for_plp(driver: webdriver.Chrome, timeout: int = 35) -> bool:
+    """
+    True => hay productos.
+    False => página sin productos (fin/no-results). No debe crashear el run.
+
+    Lanza TimeoutException solo si parece “bloqueo/interstitial” o carga rota.
+    """
+    w = WebDriverWait(driver, timeout)
+
+    # 1) readyState al menos complete
+    w.until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
+
+    # 2) esperar tiles, pero sin asumir que siempre existen
+    deadline = time.time() + timeout
+    tile_css = "article.l-plp-grid_item.m-product, article.b-product_tile_item"
+
+    while time.time() < deadline:
+        tiles = driver.find_elements(By.CSS_SELECTOR, tile_css)
+        if tiles:
+            return True
+
+        src = driver.page_source or ""
+        if _looks_blocked(src):
+            raise TimeoutException("Blocked / interstitial detected (no product tiles).")
+
+        if _looks_end_of_results(src):
+            return False
+
+        time.sleep(0.4)
+
+    # si no cargó tiles, lo tratamos como “vacío” para que stop_after_empty corte
+    return False
 
 
 # -----------------------------
@@ -201,8 +261,8 @@ def gentle_scroll(driver: webdriver.Chrome, steps: int = 4) -> None:
 # -----------------------------
 def extract_product_from_article(article) -> Dict:
     """
-    En cada item hay un .b-product con data-analytics JSON (id/name/brand/price/metric1...). :contentReference[oaicite:8]{index=8}
-    También hay markup de precios old/sales. :contentReference[oaicite:9]{index=9}
+    En cada item hay un .b-product con data-analytics JSON (id/name/brand/price/metric1...).
+    También hay markup de precios old/sales.
     """
     out: Dict = {}
 
@@ -263,7 +323,7 @@ def extract_product_from_article(article) -> Dict:
     except Exception:
         out["promo"] = None
 
-    # DOM prices fallback (content suele venir en .b-product_price-value) :contentReference[oaicite:10]{index=10}
+    # DOM prices fallback
     def _dom_price(css: str) -> Optional[float]:
         try:
             el = tile.find_element(By.CSS_SELECTOR, css)
@@ -299,9 +359,35 @@ def scrape_category(
 
     for page in range(1, max_pages + 1):
         page_url = build_page_url(base_url, page)
-        driver.get(page_url)
-        wait_for_plp(driver)
-        gentle_scroll(driver, steps=scroll_steps)
+        print(f"[page {page}/{max_pages}] {page_url}")
+
+        # jitter para bajar bloqueos/intermitencias
+        time.sleep(random.uniform(0.3, 1.0))
+
+        loaded = False
+        has_products = False
+
+        # retries “suaves” por página
+        for attempt in range(1, 4):
+            driver.get(page_url)
+            try:
+                has_products = wait_for_plp(driver, timeout=35)
+                loaded = True
+                break
+            except TimeoutException as e:
+                print(f"[warn] wait timeout (attempt {attempt}/3) on page {page}: {e}")
+                try:
+                    driver.refresh()
+                except Exception:
+                    pass
+                time.sleep(2)
+
+        if not loaded:
+            # si después de 3 intentos sigue raro, lo tratamos como página vacía para cortar sin romper todo
+            has_products = False
+
+        if has_products:
+            gentle_scroll(driver, steps=scroll_steps)
 
         articles = driver.find_elements(By.CSS_SELECTOR, "article.l-plp-grid_item.m-product, article.b-product_tile_item")
         page_rows = []
@@ -323,11 +409,14 @@ def scrape_category(
 
         if not page_rows:
             empty_streak += 1
+            print(f"[info] empty page_rows on page={page} (empty_streak={empty_streak}/{stop_after_empty})")
         else:
             empty_streak = 0
             all_rows.extend(page_rows)
+            print(f"[info] rows page={page}: {len(page_rows)} (total={len(all_rows)})")
 
         if empty_streak >= stop_after_empty:
+            print("[info] stop_after_empty reached; stopping pagination.")
             break
 
     df = pd.DataFrame(all_rows)
